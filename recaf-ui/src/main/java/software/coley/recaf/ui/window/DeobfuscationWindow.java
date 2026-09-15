@@ -159,6 +159,7 @@ public class DeobfuscationWindow extends RecafStage {
 	private final StackPane root = new StackPane();
 	private final TransformPreview beforePreview;
 	private final TransformPreview afterPreview;
+	private TreeView<TransformerTreeNode> availableTree;
 
 	private ClassInfo previewClass;
 
@@ -202,8 +203,11 @@ public class DeobfuscationWindow extends RecafStage {
 		setupStage2();
 		setupProgressModal();
 
-		// Gate stage actions on whether any transformer is selected.
-		selectedTransformers.addListener((ListChangeListener<SelectedTransformer>) change -> hasSelection.set(!selectedTransformers.isEmpty()));
+		// Gate stage actions on whether any transformer is selected and keep the available tree synchronized.
+		selectedTransformers.addListener((ListChangeListener<SelectedTransformer>) change -> {
+			hasSelection.set(!selectedTransformers.isEmpty());
+			availableTree.refresh();
+		});
 		hasSelection.set(false);
 
 		root.getChildren().addAll(stage1Pane, stage2Pane);
@@ -242,7 +246,7 @@ public class DeobfuscationWindow extends RecafStage {
 		title.getStyleClass().add(Styles.TITLE_4);
 		title.setPadding(new Insets(0, 0, 5, 5));
 
-		TreeView<TransformerTreeNode> availableTree = new TreeView<>(buildTransformerTree(descriptors));
+		availableTree = new TreeView<>(buildTransformerTree(descriptors));
 		availableTree.setShowRoot(false);
 		availableTree.setCellFactory(view -> new TreeCell<>() {
 			@Override
@@ -263,10 +267,18 @@ public class DeobfuscationWindow extends RecafStage {
 
 				// Skip re-rendering if the item is the same as before.
 				// Otherwise, you'll see a flicker for a split second which is annoying...
-				if (item.equals(oldItem))
-					return;
-
 				TransformerDescriptor descriptor = item.descriptor();
+				if (item.equals(oldItem)) {
+					// We may still need to update the toggle state if the selection changed.
+					if (descriptor != null
+							&& getGraphic() instanceof HBox graphic
+							&& !graphic.getChildren().isEmpty()
+							&& graphic.getChildren().getFirst() instanceof CheckBox toggle)
+						toggle.setSelected(findSelected(descriptor) != null);
+
+					return;
+				}
+
 				if (descriptor == null) {
 					setText(item.name());
 					setGraphic(null);
@@ -275,8 +287,11 @@ public class DeobfuscationWindow extends RecafStage {
 
 				CheckBox toggle = new CheckBox();
 				toggle.setSelected(findSelected(descriptor) != null);
-				toggle.selectedProperty().addListener((ob, old, cur) -> {
-					if (cur)
+				toggle.setOnAction(e -> {
+					// We use 'onAction' over a binding on 'selectedProperty' because the
+					// binding will trigger when the cell is recycled and re-rendered while
+					// the action event only fires when the user clicks the toggle.
+					if (toggle.isSelected())
 						select(descriptor);
 					else
 						deselect(descriptor);
@@ -661,6 +676,7 @@ public class DeobfuscationWindow extends RecafStage {
 	 * Show stage 1.
 	 */
 	private void showStage1() {
+		availableTree.refresh();
 		stage1Pane.setVisible(true);
 		stage1Pane.setManaged(true);
 		stage2Pane.setVisible(false);

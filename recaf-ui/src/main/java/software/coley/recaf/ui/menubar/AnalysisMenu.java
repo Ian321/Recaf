@@ -111,7 +111,10 @@ public class AnalysisMenu extends WorkspaceAwareMenu {
 		DeobfuscationWindow deobfuscationWindow = deobfuscationWindowProvider.get();
 		deobfuscationWindow.setOnCloseRequest(e -> deobfuscationWindowProvider.destroy(deobfuscationWindow));
 		windowManager.registerAnonymous(deobfuscationWindow);
-		deobfuscationWindow.show();
+
+		// Apply before showing so the stage-1 tree initializes with the preset selection.
 		deobfuscationWindow.applyPreset(preset);
+		deobfuscationWindow.show();
+		deobfuscationWindow.requestFocus();
 	}
 }
