@@ -64,6 +64,37 @@ public interface InvokeDynamicResolver extends PrioritySortable {
 	                              @Nonnull Frame<ReValue> frame);
 
 	/**
+	 * Attempts to resolve a dynamic call site when the primary analyzer did not provide a frame.
+	 * <p>
+	 * Resolvers should override this only when they can recover all required state directly from the instruction and
+	 * surrounding bytecode without needing stack/locals state. This is a fallback for when the analyzer finds
+	 * a call site that is deemed unreachable <i>(Which can be from genuine dead code, or intermediate transformations
+	 * making the path to the site appear dead)</i>.
+	 *
+	 * @param context
+	 * 		Transformation context for the current run.
+	 * @param workspace
+	 * 		Workspace containing the class being transformed.
+	 * @param classNode
+	 * 		Current class node containing the call site.
+	 * @param method
+	 * 		Method containing the call site.
+	 * @param instruction
+	 * 		Dynamic call site to inspect.
+	 *
+	 * @return Direct target and number of trailing call-site arguments to remove, or {@code null} when this resolver
+	 * cannot recover the site without a frame.
+	 */
+	@Nullable
+	default ResolvedInvokeDynamic resolveWithoutFrame(@Nonnull JvmTransformerContext context,
+	                                                  @Nonnull Workspace workspace,
+	                                                  @Nonnull ClassNode classNode,
+	                                                  @Nonnull MethodNode method,
+	                                                  @Nonnull InvokeDynamicInsnNode instruction) {
+		return null;
+	}
+
+	/**
 	 * Direct member target recovered from an {@code invokedynamic} call site.
 	 *
 	 * @param target

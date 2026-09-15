@@ -13,6 +13,7 @@ import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.util.CheckClassAdapter;
 import software.coley.recaf.info.ClassInfo;
 import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.services.deobfuscation.transform.generic.CallResultInliningTransformer;
@@ -23,6 +24,7 @@ import software.coley.recaf.services.deobfuscation.transform.generic.StaticValue
 import software.coley.recaf.services.deobfuscation.transform.generic.VariableFoldingTransformer;
 import software.coley.recaf.services.deobfuscation.transform.specific.zkm.ZkmDecryptionCleanupTransformer;
 import software.coley.recaf.services.deobfuscation.transform.specific.zkm.ZkmInvokeDynamicResolver;
+import software.coley.recaf.services.deobfuscation.transform.specific.zkm.ZkmParameterUnpackingTransformer;
 import software.coley.recaf.services.inheritance.InheritanceGraph;
 import software.coley.recaf.services.transform.ClassTransformer;
 import software.coley.recaf.services.transform.JvmClassTransformer;
@@ -48,10 +50,15 @@ import software.coley.recaf.workspace.model.resource.WorkspaceResource;
 import software.coley.recaf.workspace.model.resource.WorkspaceResourceBuilder;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -260,6 +267,69 @@ class ZkmDeobfuscationTest extends TestBase {
 				"StringsLong output changed after helper cleanup");
 	}
 
+	/** Verifies slight ZKM config variations of reference encryption + strings through "Method Parameter changes" still get deobfuscated. */
+	@Test
+	void rewritesSharedZkmReferenceLookups(@TempDir Path tempDirectory) throws Exception {
+		Path baselineJar = Paths.get(FIXTURE_DIRECTORY, "obf-sample-zkm-26-3e-original.jar");
+		List<String> samples = List.of(
+				"obf-sample-zkm-26-3e-shared-1.jar",
+				"obf-sample-zkm-26-3e-shared-2.jar",
+				"obf-sample-zkm-26-3e-shared-3.jar");
+		for (String sample : samples) {
+			Workspace workspace = loadClassOnlyWorkspace(Paths.get(FIXTURE_DIRECTORY, sample));
+			workspaceManager.setCurrentIgnoringConditions(workspace);
+			WorkspaceResource resource = workspace.getPrimaryResource();
+			JvmClassBundle classes = resource.getJvmClassBundle();
+
+			// Assert all samples have ZKM reference encryption calls + bootstrapping.
+			int initialZkmCount = countZkmInvokeDynamics(classes);
+			int initialLambdaCount = countLambdaInvokeDynamics(classes);
+			int initialLookupCount = countZkmLookupMethods(classes);
+			assertTrue(initialZkmCount > 0, "Expected shared ZKM sites in " + sample);
+			assertTrue(initialLookupCount > 0, "Expected shared ZKM lookup methods in " + sample);
+
+			// All samples covered in this test have a shared helper class that is used to bootstrap the ZKM reference sites.
+			ClassNode helper = parseClassNode(findClass(workspace, "n"));
+			String indexDescriptor = sample.endsWith("shared-3.jar") ? "(J)I" : "(JJ)I";
+			assertTrue(describeZkmSites(classes).stream().anyMatch(site -> site.endsWith(" @n")), "Expected a ZKM site bootstrapped by n in " + sample);
+			assertTrue(helper.methods.stream().anyMatch(method -> indexDescriptor.equals(method.desc)), "Missing " + indexDescriptor + " helper in " + sample);
+
+			// Setup transformation.
+			TransformationApplier applier = Objects.requireNonNull(recaf.get(TransformationApplierService.class).newApplierForCurrentWorkspace());
+			applier.setMaxPasses(8);
+			TransformationParameters parameters = new TransformationParameters(Map.of(InvokeDynamicInliningTransformer.KEY_MAX_STEPS, 250_000));
+			List<Class<? extends JvmClassTransformer>> pipeline = List.of(
+					ZkmParameterUnpackingTransformer.class,
+					OpaqueConstantFoldingTransformer.class,
+					VariableFoldingTransformer.class,
+					InvokeDynamicInliningTransformer.class,
+					ZkmDecryptionCleanupTransformer.class);
+
+			// Apply transformation, validate we saw changes.
+			JvmTransformResult result = applier.transformJvm(pipeline, parameters);
+			assertTrue(result.getTransformerFailures().isEmpty(), "Shared reference transformation failed for " + sample);
+			assertFalse(result.getTransformedClasses().isEmpty(), "Expected shared ZKM classes to be transformed: " + sample);
+
+			// After applying there should be no reference encryption calls remaining.
+			result.apply();
+			assertEquals(0, countZkmInvokeDynamics(classes), "All shared ZKM sites should be restored: " + sample + " " + describeZkmSites(classes));
+			assertEquals(initialLambdaCount, countLambdaInvokeDynamics(classes), "Lambda sites must remain dynamic: " + sample);
+
+			// Bootstrapping methods should be removed if they are no longer referenced.
+			assertEquals(0, countZkmLookupMethods(classes), "Unreferenced shared ZKM bootstrap methods should be removed: " + sample);
+			ClassNode cleanedHelper = parseClassNode(findClass(workspace, "n"));
+			assertEquals(Set.of("M <init>()V"), memberKeys(cleanedHelper), "Shared helper should retain only its constructor: " + sample);
+
+			// If we run the original classes and the transformed classes, the output should be the same.
+			Path transformedDirectory = tempDirectory.resolve(sample);
+			exportClassOnlyWorkspace(workspace, transformedDirectory);
+			verifyExportedClasses(classes, transformedDirectory);
+			String baselineOutput = runJava(baselineJar, "dev.lvstrng.Main", "");
+			assertTrue(baselineOutput.contains("Executed all tests!"), "Baseline did not complete: " + sample);
+			assertEquals(baselineOutput, runJava(transformedDirectory, "a", ""), "Shared transformed output changed: " + sample);
+		}
+	}
+
 	/** Ensures opaque constant folding reaches a fixed point when analyzing the obfuscated reflection helper. */
 	@Test
 	@Timeout(value = 10)
@@ -390,14 +460,27 @@ class ZkmDeobfuscationTest extends TestBase {
 				if (method.instructions == null)
 					continue;
 				for (AbstractInsnNode instruction : method.instructions)
-					if (instruction instanceof InvokeDynamicInsnNode indy
-							&& indy.bsm != null
-							&& node.name.equals(indy.bsm.getOwner())
-							&& ZKM_BOOTSTRAP_DESCRIPTOR.equals(indy.bsm.getDesc()))
+					if (instruction instanceof InvokeDynamicInsnNode indy && ZkmInvokeDynamicResolver.isZkmSite(indy))
 						count++;
 			}
 		}
 		return count;
+	}
+
+	@Nonnull
+	private static List<String> describeZkmSites(JvmClassBundle classes) {
+		List<String> result = new ArrayList<>();
+		for (JvmClassInfo classInfo : classes) {
+			ClassNode node = parseClassNode(classInfo);
+			for (MethodNode method : node.methods) {
+				if (method.instructions == null)
+					continue;
+				for (AbstractInsnNode instruction : method.instructions)
+					if (instruction instanceof InvokeDynamicInsnNode indy && ZkmInvokeDynamicResolver.isZkmSite(indy))
+						result.add(node.name + "." + method.name + method.desc + " -> " + indy.name + indy.desc + " @" + indy.bsm.getOwner());
+			}
+		}
+		return result;
 	}
 
 	private static int countLambdaInvokeDynamics(JvmClassBundle classes) {
@@ -422,9 +505,7 @@ class ZkmDeobfuscationTest extends TestBase {
 		for (JvmClassInfo classInfo : classes) {
 			ClassNode node = parseClassNode(classInfo);
 			for (MethodNode method : node.methods)
-				if ((method.access & (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC))
-						== (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC)
-						&& ZKM_BOOTSTRAP_DESCRIPTOR.equals(method.desc))
+				if (ZKM_BOOTSTRAP_DESCRIPTOR.equals(method.desc))
 					count++;
 		}
 		return count;
@@ -470,6 +551,25 @@ class ZkmDeobfuscationTest extends TestBase {
 	private static void exportClassOnlyWorkspace(Workspace workspace, Path outputDirectory) throws IOException {
 		WorkspaceExportOptions options = new WorkspaceExportOptions(WorkspaceOutputType.DIRECTORY, new PathWorkspaceExportConsumer(outputDirectory));
 		options.create().export(workspace);
+	}
+
+	private static void verifyExportedClasses(@Nonnull JvmClassBundle classes, Path outputDirectory) throws IOException {
+		try (TestClassLoader loader = new TestClassLoader(outputDirectory)) {
+			for (JvmClassInfo classInfo : classes) {
+				StringWriter verificationErrors = new StringWriter();
+				PrintWriter writer = new PrintWriter(verificationErrors);
+				assertDoesNotThrow(() -> CheckClassAdapter.verify(new ClassReader(classInfo.getBytecode()), loader, false, writer),
+						"ASM verification failed for " + classInfo.getName());
+				writer.flush();
+				assertTrue(verificationErrors.toString().isBlank(), "ASM verification reported errors for " + classInfo.getName() + ":\n" + verificationErrors);
+			}
+		}
+	}
+
+	private static final class TestClassLoader extends URLClassLoader {
+		private TestClassLoader(@Nonnull Path directory) throws IOException {
+			super(new URL[]{directory.toUri().toURL()}, TestClassLoader.class.getClassLoader());
+		}
 	}
 
 	private static String runJava(Path classpath, String className, String input) throws Exception {

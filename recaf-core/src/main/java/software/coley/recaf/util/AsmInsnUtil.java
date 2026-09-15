@@ -257,6 +257,18 @@ public class AsmInsnUtil implements Opcodes {
 	}
 
 	/**
+	 * @param instruction
+	 * 		Instruction to check.
+	 *
+	 * @return {@code true} when the instruction pushes a two-slot long value.
+	 */
+	public static boolean isWideConstant(@Nonnull AbstractInsnNode instruction) {
+		return instruction.getOpcode() == Opcodes.LCONST_0
+				|| instruction.getOpcode() == Opcodes.LCONST_1
+				|| instruction instanceof LdcInsnNode ldc && ldc.cst instanceof Long;
+	}
+
+	/**
 	 * @param access
 	 * 		Method access flags.
 	 *

@@ -110,17 +110,15 @@ public class InvokeDynamicInliningTransformer implements JvmClassTransformer {
 				if (!(insn instanceof InvokeDynamicInsnNode indy))
 					continue;
 
-				// Skip out-of-bounds frames, or frames that weren't computed (dead code).
-				if (index >= frames.length)
-					continue;
-				Frame<ReValue> frame = frames[index];
-				if (frame == null)
-					continue;
+				// A missing frame is still offered to explicitly frame-less-capable resolvers.
+				Frame<ReValue> frame = index < frames.length ? frames[index] : null;
 
 				// See if any of the resolvers can provide and rewrite the call site to a direct member.
 				for (InvokeDynamicResolver resolver : resolvers) {
 					try {
-						InvokeDynamicResolver.ResolvedInvokeDynamic resolution = resolver.resolve(context, workspace, classNode, method, indy, frame);
+						InvokeDynamicResolver.ResolvedInvokeDynamic resolution = frame != null
+								? resolver.resolve(context, workspace, classNode, method, indy, frame)
+								: resolver.resolveWithoutFrame(context, workspace, classNode, method, indy);
 						if (resolution == null)
 							continue;
 

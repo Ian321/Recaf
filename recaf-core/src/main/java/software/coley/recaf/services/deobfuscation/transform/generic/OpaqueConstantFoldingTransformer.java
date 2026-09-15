@@ -120,8 +120,10 @@ public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
 				throw new TransformationException("Error encountered when folding constants", t);
 			}
 		}
-		if (dirty)
+		if (dirty) {
+			context.setRecomputeFrames(className);
 			context.setNode(bundle, initialClassState, node);
+		}
 	}
 
 	/**

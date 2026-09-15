@@ -586,9 +586,9 @@ public class ZkmDecryptionCleanupTransformer implements JvmClassTransformer {
 			if (method == null)
 				continue;
 
-			// Must be a private static method that is not abstract or native, and not a constructor or class initializer.
+			// Generated shared-helper adapters can be public, but every helper must still be static and concrete.
 			found = true;
-			if ((method.access & (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC)) != (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC)
+			if ((method.access & Opcodes.ACC_STATIC) == 0
 					|| (method.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0
 					|| "<init>".equals(method.name) || "<clinit>".equals(method.name))
 				return false;

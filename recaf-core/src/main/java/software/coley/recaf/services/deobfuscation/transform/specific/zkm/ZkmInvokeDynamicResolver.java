@@ -19,6 +19,7 @@ import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.VarInsnNode;
 import org.objectweb.asm.tree.analysis.Frame;
 import software.coley.recaf.behavior.PriorityKeys;
 import software.coley.recaf.info.JvmClassInfo;
@@ -44,6 +45,7 @@ import software.coley.recaf.util.analysis.value.LongValue;
 import software.coley.recaf.util.analysis.value.ReValue;
 import software.coley.recaf.util.analysis.value.StringValue;
 import software.coley.recaf.workspace.model.Workspace;
+import software.coley.recaf.workspace.model.bundle.JvmClassBundle;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -59,6 +61,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 import static org.objectweb.asm.Opcodes.*;
+import static software.coley.recaf.util.AsmInsnUtil.getPreviousInsn;
 import static software.coley.recaf.util.Types.isPrimitive;
 
 /**
@@ -80,11 +83,13 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	/** Descriptor used by ZKM's per-class bootstrap method. */
 	public static final String BOOTSTRAP_DESCRIPTOR =
 			"(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;";
-	private static final int METADATA_ARGUMENT_COUNT = 2;
 	private static final int DEFAULT_MAX_STEPS = 40_000;
 	private static final String RESOLVER_DESCRIPTOR =
 			"(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/invoke/MutableCallSite;"
 					+ "Ljava/lang/String;Ljava/lang/invoke/MethodType;JJ)Ljava/lang/invoke/MethodHandle;";
+	private static final String RESOLVER_DESCRIPTOR_ALT =
+			"(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/invoke/MutableCallSite;"
+					+ "Ljava/lang/String;Ljava/lang/invoke/MethodType;J)Ljava/lang/invoke/MethodHandle;";
 
 	private final InheritanceGraphService graphService;
 	private volatile InheritanceGraph inheritanceGraph;
@@ -117,49 +122,165 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	                                                           @Nonnull MethodNode method,
 	                                                           @Nonnull InvokeDynamicInsnNode instruction,
 	                                                           @Nonnull Frame<ReValue> frame) {
-		// Must look like a ZKM bootstrap.
-		if (!isZkmSite(classNode, instruction))
+		PreparedSite site = prepareSite(context, workspace, classNode, instruction);
+		if (site == null)
+			return null;
+		long[] metadataKeys = keysFromFrame(frame, site.metadataKeyCount);
+		if (metadataKeys == null)
+			return null;
+		return resolveWithKeys(context, workspace, classNode, instruction, site, metadataKeys);
+	}
+
+	@Nullable
+	@Override
+	public InvokeDynamicResolver.ResolvedInvokeDynamic resolveWithoutFrame(@Nonnull JvmTransformerContext context,
+	                                                                       @Nonnull Workspace workspace,
+	                                                                       @Nonnull ClassNode classNode,
+	                                                                       @Nonnull MethodNode method,
+	                                                                       @Nonnull InvokeDynamicInsnNode instruction) {
+		PreparedSite site = prepareSite(context, workspace, classNode, instruction);
+		if (site == null)
+			return null;
+		long[] metadataKeys = keysFromInstructions(method, instruction, site.metadataKeyCount);
+		if (metadataKeys == null)
+			return null;
+		return resolveWithKeys(context, workspace, classNode, instruction, site, metadataKeys);
+	}
+
+	@Nullable
+	private PreparedSite prepareSite(@Nonnull JvmTransformerContext context,
+	                                 @Nonnull Workspace workspace,
+	                                 @Nonnull ClassNode classNode,
+	                                 @Nonnull InvokeDynamicInsnNode instruction) {
+		// Must look like a ZKM bootstrap and point at a class in the current workspace.
+		if (!isZkmSite(instruction))
 			return null;
 
-		// The last two arguments of the call-site must be literal metadata keys.
+		// Extract the bootstrap resolver owner and find its class node.
+		// If the owner is not in the workspace, we cannot resolve it.
+		String helperOwner = instruction.bsm.getOwner();
+		ClassPathNode helperPath = workspace.findJvmClass(true, helperOwner);
+		if (helperPath == null)
+			return null;
+		JvmClassBundle helperBundle = helperPath.getValueOfType(JvmClassBundle.class);
+		if (helperBundle == null)
+			return null;
+		JvmClassInfo helperInfo = helperPath.getValue().asJvmClass();
+
+		// Keep class-local sites tied to the node currently being transformed, while shared sites use the helper owner node.
+		// Some ZKM configurations will put the index helper components in the same class as the call-site, while others will put them in a shared helper class.
+		//
+		// Generally the structure you're looking for is:
+		//  private static Object[] objectCache;
+		//  private static String[] descriptorCache;
+		//   ...
+		//  private static int indexHelper(long key0, long key1) { ... }
+		//  private static MethodHandle resolve(Lookup, MutableCallSite, String, MethodType, long, long) { ... }
+		ClassNode helperNode = helperOwner.equals(classNode.name) ? classNode : context.getNode(helperBundle, helperInfo);
+
+		// Parse and validate the call-site metadata suffix before either key source is considered.
 		Type[] callSiteArguments;
 		try {
 			callSiteArguments = Type.getArgumentTypes(instruction.desc);
 		} catch (RuntimeException ignored) {
 			return null;
 		}
-		if (callSiteArguments.length < METADATA_ARGUMENT_COUNT
-				|| !Type.LONG_TYPE.equals(callSiteArguments[callSiteArguments.length - 1])
-				|| !Type.LONG_TYPE.equals(callSiteArguments[callSiteArguments.length - 2]))
-			return null;
 
-		// Reachable frames must carry both literal metadata keys at the top of the call-site stack.
-		int stackSize = frame.getStackSize();
-		if (stackSize < METADATA_ARGUMENT_COUNT)
-			return null;
-		ReValue firstKey = frame.getStack(stackSize - METADATA_ARGUMENT_COUNT);
-		ReValue secondKey = frame.getStack(stackSize - 1);
-		if (!(firstKey instanceof LongValue firstLong) || !(secondKey instanceof LongValue secondLong))
-			return null;
-		OptionalLong firstValue = firstLong.value();
-		OptionalLong secondValue = secondLong.value();
-		if (firstValue.isEmpty() || secondValue.isEmpty())
-			return null;
-
-		// Discover generated helper fields once.
-		// The mutable evaluator state is shared at the class scope and synchronized.
-		// The transformation applier runs in parallel, so we need to cache the discovered metadata and state per-class.
-		Metadata metadata = metadataCache.computeIfAbsent(classNode.name, ignored -> Optional.ofNullable(discoverMetadata(classNode))).orElse(null);
+		// Discover generated helper fields once per bootstrap owner.
+		Metadata metadata = metadataCache.computeIfAbsent(helperOwner, _ -> Optional.ofNullable(discoverMetadata(helperNode))).orElse(null);
 		if (metadata == null)
 			return null;
-		ClassState state = stateCache.computeIfAbsent(classNode.name, ignored -> new ClassState(classNode, metadata));
+
+		// Sanity check that the call-site has enough trailing long arguments to match the discovered metadata keys.
+		int metadataKeyCount = metadata.metadataKeyCount;
+		if (callSiteArguments.length < metadataKeyCount)
+			return null;
+		for (int index = callSiteArguments.length - metadataKeyCount; index < callSiteArguments.length; index++)
+			if (!Type.LONG_TYPE.equals(callSiteArguments[index]))
+				return null;
+		return new PreparedSite(helperOwner, helperNode, metadata, metadataKeyCount);
+	}
+
+	@Nullable
+	private static long[] keysFromFrame(@Nonnull Frame<ReValue> frame, int metadataKeyCount) {
+		int stackSize = frame.getStackSize();
+		if (stackSize < metadataKeyCount)
+			return null;
+		long[] metadataKeys = new long[metadataKeyCount];
+		for (int index = 0; index < metadataKeyCount; index++) {
+			ReValue key = frame.getStack(stackSize - metadataKeyCount + index);
+			if (!(key instanceof LongValue longKey))
+				return null;
+			OptionalLong value = longKey.value();
+			if (value.isEmpty())
+				return null;
+			metadataKeys[index] = value.getAsLong();
+		}
+		return metadataKeys;
+	}
+
+	@Nullable
+	private static long[] keysFromInstructions(@Nonnull MethodNode method,
+	                                           @Nonnull InvokeDynamicInsnNode instruction,
+	                                           int metadataKeyCount) {
+		long[] metadataKeys = new long[metadataKeyCount];
+		AbstractInsnNode current = getPreviousInsn(instruction);
+		for (int index = metadataKeyCount - 1; index >= 0; index--) {
+			Long key = longConstant(current);
+			if (key == null && current instanceof VarInsnNode load && load.getOpcode() == LLOAD)
+				key = findLongLocalConstant(load.var, load);
+			if (key == null)
+				return null;
+			metadataKeys[index] = key;
+			current = getPreviousInsn(current);
+		}
+		return metadataKeys;
+	}
+
+	@Nullable
+	private static Long findLongLocalConstant(int slot, @Nonnull AbstractInsnNode load) {
+		Long candidate = null;
+		AbstractInsnNode current = getPreviousInsn(load);
+		while (current != null) {
+			if (current instanceof VarInsnNode store && store.getOpcode() == LSTORE && store.var == slot) {
+				Long literal = longConstant(getPreviousInsn(store));
+				if (literal == null || candidate != null)
+					return null;
+				candidate = literal;
+			}
+			current = getPreviousInsn(current);
+		}
+		return candidate;
+	}
+
+	@Nullable
+	private static Long longConstant(@Nullable AbstractInsnNode instruction) {
+		if (instruction == null)
+			return null;
+		return switch (instruction.getOpcode()) {
+			case LCONST_0 -> 0L;
+			case LCONST_1 -> 1L;
+			case LDC -> instruction instanceof LdcInsnNode ldc && ldc.cst instanceof Long value ? value : null;
+			default -> null;
+		};
+	}
+
+	@Nullable
+	private InvokeDynamicResolver.ResolvedInvokeDynamic resolveWithKeys(@Nonnull JvmTransformerContext context,
+	                                                                    @Nonnull Workspace workspace,
+	                                                                    @Nonnull ClassNode classNode,
+	                                                                    @Nonnull InvokeDynamicInsnNode instruction,
+	                                                                    @Nonnull PreparedSite site,
+	                                                                    @Nonnull long[] metadataKeys) {
+		// Decode the metadata keys into a member descriptor using the discovered helper component.
 		InheritanceGraph graph = inheritanceGraph;
 		if (graph == null)
 			graph = graphService.getOrCreateInheritanceGraph(workspace);
-		int maxSteps = Math.max(1, context.getParameters().getInt(InvokeDynamicInliningTransformer.KEY_MAX_STEPS, DEFAULT_MAX_STEPS));
+		ClassState state = stateCache.computeIfAbsent(site.helperOwner, ignored -> new ClassState(site.helperNode, site.metadata));
 		DecodedMember decoded;
 		try {
-			decoded = state.decode(context, workspace, graph, maxSteps, instruction.name, firstValue.getAsLong(), secondValue.getAsLong());
+			int maxSteps = Math.max(1, context.getParameters().getInt(InvokeDynamicInliningTransformer.KEY_MAX_STEPS, DEFAULT_MAX_STEPS));
+			decoded = state.decode(context, workspace, graph, maxSteps, instruction.name, metadataKeys);
 		} catch (Exception ignored) {
 			return null;
 		}
@@ -167,23 +288,22 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 			return null;
 
 		// Resolve only declared workspace metadata and enforce lookup access before emitting a handle.
-		return resolveMember(workspace, graph, classNode.name, decoded, metadata.operationCodes);
+		return resolveMember(workspace, graph, classNode.name, decoded, site.metadata.operationCodes, site.metadataKeyCount);
 	}
 
 	/**
-	 * Checks whether an instruction uses ZKM's class-local bootstrap shape.
+	 * Checks whether an instruction uses ZKM's bootstrap shape.
 	 *
-	 * @param classNode
-	 * 		Class containing the instruction.
 	 * @param instruction
 	 * 		Dynamic instruction to inspect.
 	 *
-	 * @return {@code true} when the bootstrap belongs to the class and has ZKM's descriptor.
+	 * @return {@code true} when the bootstrap has a non-empty owner and ZKM's descriptor.
 	 */
-	public static boolean isZkmSite(@Nonnull ClassNode classNode, @Nonnull InvokeDynamicInsnNode instruction) {
-		return instruction.bsm != null
-				&& classNode.name.equals(instruction.bsm.getOwner())
-				&& BOOTSTRAP_DESCRIPTOR.equals(instruction.bsm.getDesc());
+	public static boolean isZkmSite(@Nonnull InvokeDynamicInsnNode instruction) {
+		if (instruction.bsm == null || !BOOTSTRAP_DESCRIPTOR.equals(instruction.bsm.getDesc()))
+			return false;
+		String owner = instruction.bsm.getOwner();
+		return owner != null && !owner.isEmpty();
 	}
 
 	/**
@@ -195,9 +315,15 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	@Nullable
 	private static Metadata discoverMetadata(@Nonnull ClassNode classNode) {
 		for (MethodNode method : classNode.methods) {
-			// The index helper is a static method with two long arguments and an int return type.
-			if ((method.access & ACC_STATIC) == 0 || !"(JJ)I".equals(method.desc) || !isIndexHelper(method))
+			// The index helper is a static method with one or two long arguments and returns the decoded cache slot.
+			if ((method.access & ACC_STATIC) == 0 || !isIndexHelper(classNode, method))
 				continue;
+			Type[] helperArguments;
+			try {
+				helperArguments = Type.getArgumentTypes(method.desc);
+			} catch (Throwable ignored) {
+				continue;
+			}
 
 			// The index helper reads two static arrays, one for object values and one for descriptor values.
 			Set<FieldKey> objectFields = new LinkedHashSet<>();
@@ -217,7 +343,7 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 			// so we can discover the class types and operation codes from it.
 			Map<Integer, Type> classTypes = discoverClassTypes(seed);
 			OperationCodes operationCodes = discoverOperationCodes(classNode);
-			return new Metadata(new MethodKey(method.name, method.desc), objectField, descriptorField,
+			return new Metadata(new MethodKey(method.name, method.desc), helperArguments.length, objectField, descriptorField,
 					new MethodKey(seed.name, seed.desc), classTypes, operationCodes);
 		}
 		return null;
@@ -245,17 +371,17 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 		helperMethods.add(metadata.indexMethod);
 		helperMethods.add(metadata.seedMethod);
 		for (MethodNode method : classNode.methods) {
-			if ((method.access & (ACC_PRIVATE | ACC_STATIC)) != (ACC_PRIVATE | ACC_STATIC))
+			boolean privateStatic = (method.access & (ACC_PRIVATE | ACC_STATIC)) == (ACC_PRIVATE | ACC_STATIC);
+			boolean sharedEntry = BOOTSTRAP_DESCRIPTOR.equals(method.desc)
+					|| isResolverDescriptor(method.desc)
+					|| isSpreadBootstrap(method);
+			if (!privateStatic && !sharedEntry)
 				continue;
-			if (BOOTSTRAP_DESCRIPTOR.equals(method.desc)
-					|| RESOLVER_DESCRIPTOR.equals(method.desc)
-					|| isSpreadBootstrap(method)
-					|| isStringDecoder(method)
-					|| isNumericDecoder(method))
+			if (sharedEntry || isStringDecoder(method) || isNumericDecoder(method))
 				helperMethods.add(new MethodKey(method.name, method.desc));
 		}
 
-		// Follow calls between same-class private methods so that all helpers are included in the set.
+		// Follow calls between generated static methods so shared helpers include their public lookup adapters too.
 		boolean changed;
 		do {
 			changed = false;
@@ -267,7 +393,7 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 					if (!(instruction instanceof MethodInsnNode call) || !classNode.name.equals(call.owner))
 						continue;
 					MethodNode target = findMethod(classNode, new MethodKey(call.name, call.desc));
-					if (target == null || (target.access & (ACC_PRIVATE | ACC_STATIC)) != (ACC_PRIVATE | ACC_STATIC))
+					if (target == null || (target.access & ACC_STATIC) == 0)
 						continue;
 					changed |= helperMethods.add(new MethodKey(target.name, target.desc));
 				}
@@ -393,16 +519,9 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 			}
 		} while (changed);
 
-		// Collect any mutable static primitive fields, which are generally part of ZKM's cross-class control state.
+		// Collect only primitive fields referenced by helper methods.
+		// Unreferenced application fields shouldn't be treated as ZKM state just because they share a class with generated helpers.
 		Set<FieldKey> stateFields = new HashSet<>();
-		for (FieldNode field : classNode.fields) {
-			// Skip non-static fields, final fields, and non-primitive fields.
-			if ((field.access & ACC_STATIC) == 0 || (field.access & ACC_FINAL) != 0 || !isPrimitive(field.desc))
-				continue;
-			stateFields.add(new FieldKey(classNode.name, field.name, field.desc));
-		}
-
-		// Also add fields referenced by the helper methods.
 		for (MethodKey helper : helperMethods) {
 			MethodNode method = findMethod(classNode, helper);
 			if (method == null || method.instructions == null)
@@ -451,7 +570,8 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 		return "[Ljava/lang/Object;".equals(descriptor)
 				|| "[Ljava/lang/String;".equals(descriptor)
 				|| "[J".equals(descriptor)
-				|| "[Ljava/lang/Integer;".equals(descriptor);
+				|| "[Ljava/lang/Integer;".equals(descriptor)
+				|| "[Ljava/lang/Long;".equals(descriptor);
 	}
 
 	/**
@@ -492,14 +612,27 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	}
 
 	/**
+	 * @param descriptor
+	 * 		Method descriptor to check.
+	 *
+	 * @return {@code true} when the descriptor is one of ZKM's resolver shapes.
+	 */
+	private static boolean isResolverDescriptor(@Nonnull String descriptor) {
+		return RESOLVER_DESCRIPTOR.equals(descriptor) || RESOLVER_DESCRIPTOR_ALT.equals(descriptor);
+	}
+
+	/**
 	 * @param method
 	 * 		Method to check.
 	 *
 	 * @return {@code true} when the method is in the shape of ZKM's string decoder.
 	 */
 	private static boolean isStringDecoder(@Nonnull MethodNode method) {
-		// Descriptor must match, must have instructions.
-		if (!"(III)Ljava/lang/String;".equals(method.desc) || method.instructions == null)
+		if (method.instructions == null)
+			return false;
+
+		// Descriptor must match one of the two string decoder shapes.
+		if (!("(III)Ljava/lang/String;".equals(method.desc) || "(II)Ljava/lang/String;".equals(method.desc)))
 			return false;
 
 		// Must read a static array of string values.
@@ -508,6 +641,10 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 					&& instruction.getOpcode() == GETSTATIC
 					&& "[Ljava/lang/String;".equals(field.desc))
 				return true;
+
+		// There are other indicators we can also use but so far the above are enough.
+		//  - while (n < charArray.length) { /* xor logic*/ }
+		//  - stringArrayField[i] = new String(charArray).intern();
 		return false;
 	}
 
@@ -518,21 +655,26 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	 * @return {@code true} when the method is in the shape of ZKM's numeric decoder.
 	 */
 	private static boolean isNumericDecoder(@Nonnull MethodNode method) {
-		// Descriptor must match, must have instructions, and must not be the index helper.
-		if (!"(IJ)I".equals(method.desc) || method.instructions == null || isIndexHelper(method))
+		if (method.instructions == null)
 			return false;
 
-		// Must read a static array of either long or boxed integer values.
+		// Descriptor must match one of the two numeric decoder shapes.
+		if (!("(IJ)I".equals(method.desc) || "(IJ)J".equals(method.desc)))
+			return false;
+
+		// Must read a static array of long or boxed numeric values.
 		for (AbstractInsnNode instruction : method.instructions)
 			if (instruction instanceof FieldInsnNode field
 					&& instruction.getOpcode() == GETSTATIC
-					&& ("[J".equals(field.desc) || "[Ljava/lang/Integer;".equals(field.desc)))
+					&& ("[J".equals(field.desc)
+					|| "[Ljava/lang/Integer;".equals(field.desc)
+					|| "[Ljava/lang/Long;".equals(field.desc)))
 				return true;
 		return false;
 	}
 
 	/**
-	 * ZKM's index helper looks roughly like this:
+	 * ZKM's index helper looks roughly like this <i>(There is a single long variant, general structure is same)</i>:
 	 * <pre>{@code
 	 * private static int indexHelper(long key0, long key1) {
 	 *     // Combine the two call-site metadata values.
@@ -569,25 +711,43 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	 *         chars[i] ^= key[i % 6];
 	 *
 	 *     // Cache the decoded value.
-	 *     decodedStrings[slot] = new String(chars);
+	 *     decodedStrings[slot] = new String(chars); // Does not use '.intern()' like the string decoder does.
 	 *
 	 *     return slot;
 	 * }
 	 * }</pre>
 	 *
+	 * @param classNode
+	 * 		Class declaring the method and its cache fields.
 	 * @param method
 	 * 		Method to check.
 	 *
 	 * @return {@code true} when the method is in the shape of ZKM's index helper.
 	 */
-	private static boolean isIndexHelper(@Nonnull MethodNode method) {
+	private static boolean isIndexHelper(@Nonnull ClassNode classNode, @Nonnull MethodNode method) {
 		InsnList instructions = method.instructions;
-		if (instructions == null)
+		if (instructions == null || (method.access & ACC_STATIC) == 0)
 			return false;
+
+		// Index helpers take one or two long arguments and return the decoded cache slot as an int.
+		Type[] arguments;
+		try {
+			arguments = Type.getArgumentTypes(method.desc);
+			if (!Type.INT_TYPE.equals(Type.getReturnType(method.desc)) || (arguments.length != 1 && arguments.length != 2))
+				return false;
+			for (Type argument : arguments)
+				if (!Type.LONG_TYPE.equals(argument))
+					return false;
+		} catch (RuntimeException ignored) {
+			return false;
+		}
+
+		// Heuristic fingerprint of the index helper's operations.
 		boolean hasXor = false;
 		boolean hasOr = false;
 		boolean hasLeftShift = false;
-		boolean hasUnsignedRightShift = false;
+		boolean hasSlotShift = false;
+		boolean hasSelectorShift = false;
 		boolean hasLongToInt = false;
 		boolean hasObjectArray = false;
 		boolean hasStringArray = false;
@@ -596,14 +756,23 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 			hasXor |= opcode == LXOR;
 			hasOr |= opcode == LOR;
 			hasLeftShift |= opcode == LSHL && hasNearbyConstant(instructions, instruction, 48);
-			hasUnsignedRightShift |= opcode == LUSHR && hasNearbyConstant(instructions, instruction, 46);
+			hasSlotShift |= opcode == LUSHR && hasNearbyConstant(instructions, instruction, 46);
+			hasSelectorShift |= opcode == LUSHR && hasNearbyConstant(instructions, instruction, 42);
 			hasLongToInt |= opcode == L2I;
-			if (instruction instanceof FieldInsnNode field && opcode == GETSTATIC) {
+			if (instruction instanceof FieldInsnNode field
+					&& opcode == GETSTATIC
+					&& classNode.name.equals(field.owner)) {
 				hasObjectArray |= "[Ljava/lang/Object;".equals(field.desc);
 				hasStringArray |= "[Ljava/lang/String;".equals(field.desc);
 			}
 		}
-		return hasXor && hasOr && hasLeftShift && hasUnsignedRightShift && hasLongToInt && hasObjectArray && hasStringArray;
+
+		// The original layout mixes two keys with a 48-bit rotate-like operation.
+		if (arguments.length == 2)
+			return hasXor && hasOr && hasLeftShift && hasSlotShift && hasLongToInt && hasObjectArray && hasStringArray;
+
+		// The shared one-key layout derives both the slot and string selector directly from its key.
+		return hasSlotShift && hasSelectorShift && hasLongToInt && hasObjectArray && hasStringArray;
 	}
 
 	/**
@@ -631,7 +800,7 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	 * @param classNode
 	 * 		Class being inspected.
 	 * @param helperMethod
-	 * 		The helper method to inspect for static array reads. See {@link #isIndexHelper(MethodNode)}.
+	 * 		The helper method to inspect for static array reads. See {@link #isIndexHelper(ClassNode, MethodNode)}.
 	 * @param objectFields
 	 * 		Set of object array fields to populate.
 	 * @param descriptorFields
@@ -860,7 +1029,7 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	private static OperationCodes discoverOperationCodes(@Nonnull ClassNode classNode) {
 		// Selector bytes vary per generated class, so derive them from lookup calls instead of hardcoding a table.
 		for (MethodNode method : classNode.methods) {
-			if (!RESOLVER_DESCRIPTOR.equals(method.desc))
+			if (!isResolverDescriptor(method.desc))
 				continue;
 			int getField = findOperationCode(method, "findGetter");
 			int putField = findOperationCode(method, "findSetter");
@@ -962,6 +1131,8 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	 * 		Decoded member to resolve.
 	 * @param operationCodes
 	 * 		Operation codes for the ZKM class that generated the dynamic site.
+	 * @param metadataKeyCount
+	 * 		Number of trailing metadata arguments to remove from the call site.
 	 *
 	 * @return Resolved dynamic site, or {@code null} when the member cannot be resolved.
 	 */
@@ -970,7 +1141,8 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	                                                                         @Nonnull InheritanceGraph graph,
 	                                                                         @Nonnull String caller,
 	                                                                         @Nonnull DecodedMember member,
-	                                                                         @Nonnull OperationCodes operationCodes) {
+	                                                                         @Nonnull OperationCodes operationCodes,
+	                                                                         int metadataKeyCount) {
 		// Must be a known operation code, otherwise the bootstrap will throw an exception.
 		int operation = operation(member.operationName);
 		if (operation < 0 || !operationCodes.hasKnownOperation())
@@ -1004,18 +1176,18 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 					: matches(operation, operationCodes.getStatic) ? H_GETSTATIC : H_PUTSTATIC;
 			return new InvokeDynamicResolver.ResolvedInvokeDynamic(
 					new Handle(tag, match.ownerName, match.member.getName(), match.member.getDescriptor(),
-							match.ownerInfo.hasInterfaceModifier()), METADATA_ARGUMENT_COUNT);
+							match.ownerInfo.hasInterfaceModifier()), metadataKeyCount);
 		}
 
 		// Resolve method operations.
 		if (matches(operation, operationCodes.invokeStatic))
-			return resolveMethod(workspace, graph, caller, member, H_INVOKESTATIC);
+			return resolveMethod(workspace, graph, caller, member, H_INVOKESTATIC, metadataKeyCount);
 		if (matches(operation, operationCodes.invokeVirtual))
-			return resolveMethod(workspace, graph, caller, member, -1);
+			return resolveMethod(workspace, graph, caller, member, -1, metadataKeyCount);
 
 		// The generated bootstrap dispatches its remaining method selector through findSpecial without a separate
 		// comparison, so an unmatched non-field/non-method selector has findSpecial semantics.
-		return resolveMethod(workspace, graph, caller, member, H_INVOKESPECIAL);
+		return resolveMethod(workspace, graph, caller, member, H_INVOKESPECIAL, metadataKeyCount);
 	}
 
 	private static int operation(@Nonnull String name) {
@@ -1038,6 +1210,8 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	 * @param requestedTag
 	 * 		The {@link Handle#getTag()} to use for the resolved handle,
 	 * 		or {@code -1} to derive the tag from the resolved member.
+	 * @param metadataKeyCount
+	 * 		Number of trailing metadata arguments to remove from the call site.
 	 *
 	 * @return Resolved dynamic site, or {@code null} when the member cannot be resolved.
 	 */
@@ -1046,7 +1220,8 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	                                                                         @Nonnull InheritanceGraph graph,
 	                                                                         @Nonnull String caller,
 	                                                                         @Nonnull DecodedMember member,
-	                                                                         int requestedTag) {
+	                                                                         int requestedTag,
+	                                                                         int metadataKeyCount) {
 		// Build the method descriptor from the decoded member's return type and parameter types.
 		String descriptor;
 		try {
@@ -1078,7 +1253,7 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 			tag = match.ownerInfo.hasInterfaceModifier() ? H_INVOKEINTERFACE : H_INVOKEVIRTUAL;
 		return new InvokeDynamicResolver.ResolvedInvokeDynamic(
 				new Handle(tag, match.ownerName, match.member.getName(), match.member.getDescriptor(),
-						match.ownerInfo.hasInterfaceModifier()), METADATA_ARGUMENT_COUNT);
+						match.ownerInfo.hasInterfaceModifier()), metadataKeyCount);
 	}
 
 	private static boolean isSpecialLookupAllowed(@Nonnull String caller,
@@ -1377,14 +1552,14 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 		                                          @Nonnull InheritanceGraph graph,
 		                                          int maxSteps,
 		                                          @Nonnull String operationName,
-		                                          long firstKey,
-		                                          long secondKey) {
+		                                          @Nonnull long[] metadataKeys) {
 			// Initialize the evaluator and cache metadata once before resolving any slot.
-			if (!initialize(context, workspace, graph, maxSteps) || indexMethod == null)
+			if (!initialize(context, workspace, graph, maxSteps) || indexMethod == null
+					|| metadataKeys.length != metadata.metadataKeyCount)
 				return null;
 
-			// Use the two call-site keys to recover the shared metadata slot.
-			Integer slot = evaluateIndex(indexMethod, firstKey, secondKey);
+			// Use the call-site keys to recover the shared metadata slot.
+			Integer slot = evaluateIndex(indexMethod, metadataKeys);
 			if (slot == null)
 				return null;
 
@@ -1554,8 +1729,11 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 		}
 
 		@Nullable
-		private Integer evaluateIndex(@Nonnull MethodNode indexMethod, long firstKey, long secondKey) {
-			EvaluationResult result = evaluator.evaluate(classNode, indexMethod, null, List.of(LongValue.of(firstKey), LongValue.of(secondKey)));
+		private Integer evaluateIndex(@Nonnull MethodNode indexMethod, @Nonnull long[] metadataKeys) {
+			List<ReValue> arguments = metadataKeys.length == 1
+					? List.of(LongValue.of(metadataKeys[0]))
+					: List.of(LongValue.of(metadataKeys[0]), LongValue.of(metadataKeys[1]));
+			EvaluationResult result = evaluator.evaluate(classNode, indexMethod, null, arguments);
 			if (!(result instanceof EvaluationYieldResult(ReValue value)) || !(value instanceof IntValue intValue))
 				return null;
 			OptionalInt opt = intValue.value();
@@ -1597,7 +1775,8 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 			}
 			if (indexMethod == null)
 				return null;
-			Integer slot = evaluateIndex(indexMethod, key, 0L);
+			long[] classTokenKeys = metadata.metadataKeyCount == 1 ? new long[]{key} : new long[]{key, 0L};
+			Integer slot = evaluateIndex(indexMethod, classTokenKeys);
 			if (slot == null || slot < 0)
 				return null;
 			Type direct = metadata.classTypes.get(slot);
@@ -1631,7 +1810,7 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	 * Structural members belonging to one generated ZKM helper component.
 	 *
 	 * @param helperMethods
-	 * 		Private methods that are part of the generated helper component.
+	 * 		Generated static methods that are part of the helper component.
 	 * @param helperFields
 	 * 		Generated cache and storage fields owned by the helper component.
 	 * @param stateFields
@@ -1648,10 +1827,29 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	                       @Nullable FieldKey descriptorField) {}
 
 	/**
+	 * Helper and metadata state prepared before either key source is read.
+	 *
+	 * @param helperOwner
+	 * 		Bootstrap/helper owner name.
+	 * @param helperNode
+	 * 		Current helper owner node.
+	 * @param metadata
+	 * 		Metadata discovered from the helper node.
+	 * @param metadataKeyCount
+	 * 		Validated number of trailing metadata keys.
+	 */
+	private record PreparedSite(@Nonnull String helperOwner,
+	                            @Nonnull ClassNode helperNode,
+	                            @Nonnull Metadata metadata,
+	                            int metadataKeyCount) {}
+
+	/**
 	 * Immutable metadata discovered from one generated class.
 	 *
 	 * @param indexMethod
 	 * 		Index helper method.
+	 * @param metadataKeyCount
+	 * 		Number of long metadata keys accepted by the index helper.
 	 * @param objectField
 	 * 		Object cache field.
 	 * @param descriptorField
@@ -1664,6 +1862,7 @@ public class ZkmInvokeDynamicResolver implements InvokeDynamicResolver {
 	 * 		Operation selector values from the generated bootstrap method.
 	 */
 	private record Metadata(@Nonnull MethodKey indexMethod,
+	                        int metadataKeyCount,
 	                        @Nonnull FieldKey objectField,
 	                        @Nonnull FieldKey descriptorField,
 	                        @Nonnull MethodKey seedMethod,
