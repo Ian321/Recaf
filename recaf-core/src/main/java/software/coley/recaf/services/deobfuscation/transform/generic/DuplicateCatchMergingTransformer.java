@@ -14,6 +14,7 @@ import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.services.transform.JvmClassTransformer;
 import software.coley.recaf.services.transform.JvmTransformerContext;
 import software.coley.recaf.services.transform.TransformationException;
+import software.coley.recaf.services.transform.TransformationParameter;
 import software.coley.recaf.workspace.model.Workspace;
 import software.coley.recaf.workspace.model.bundle.JvmClassBundle;
 import software.coley.recaf.workspace.model.resource.WorkspaceResource;
@@ -35,9 +36,12 @@ import static software.coley.recaf.util.AsmInsnUtil.*;
  */
 @Dependent
 public class DuplicateCatchMergingTransformer implements JvmClassTransformer {
-	/** Key for the minimum catch block size to consider merging. */
-	public static final String KEY_MIN_BLOCK_THRESHOLD = "duplicate-catch-merging.min-block-threshold";
+	public static final String IDENTIFIER = "peephole.flow.duplicatecatch";
+	public static final String KEY_MIN_BLOCK_THRESHOLD = IDENTIFIER + ".min-block-threshold";
+
 	private static final int DEFAULT_MIN_BLOCK_THRESHOLD = 4;
+	private static final TransformationParameter<Integer> MIN_BLOCK_THRESHOLD_PARAMETER =
+			new TransformationParameter<>(KEY_MIN_BLOCK_THRESHOLD, int.class, 4);
 
 	/**
 	 * Allows us to skip blocks that are too simple to bother merging.
@@ -142,8 +146,14 @@ public class DuplicateCatchMergingTransformer implements JvmClassTransformer {
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Duplicate catch merging";
+	public String identifier() {
+		return IDENTIFIER;
+	}
+
+	@Nonnull
+	@Override
+	public List<TransformationParameter<?>> getParameterDefinitions() {
+		return List.of(MIN_BLOCK_THRESHOLD_PARAMETER);
 	}
 
 	/**

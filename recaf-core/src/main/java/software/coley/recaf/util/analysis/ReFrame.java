@@ -31,6 +31,7 @@ public class ReFrame extends Frame<ReValue> {
 	private int stackSnapshotSize;
 	private int localsSnapshotSize;
 	private Branching branchState;
+	private boolean branchStateChanged;
 	private boolean template;
 
 
@@ -210,6 +211,7 @@ public class ReFrame extends Frame<ReValue> {
 			// Template frames must take a full copy of the originating frame.
 			init(frame);
 			template = false;
+			branchStateChanged = false;
 
 			// Quick return since we don't need to call super.merge()
 			// since all values are the same as the originating frame.
@@ -218,9 +220,17 @@ public class ReFrame extends Frame<ReValue> {
 
 		// We will merge this frame's values, but return false when the observed branching state is 'never taken'.
 		// The branching state is updated when we handle execution of a branching instruction targeting this frame.
-		// If we can asser that the branching behavior for this frame is 'never taken' then returning false here
+		// If we can assert that the branching behavior for this frame is 'never taken' then returning false here
 		// will prevent the parent analyzer from continuing execution from this point.
-		return super.merge(frame, interpreter);
+		//
+		// Branch reachability can change without changing values, so report that metadata change to the work-list.
+		// This can occur when a path we observe to some frame is not taken at first, but a later path to it is taken.
+		// If both have the same execution state at the originating frame, then the values will not change,
+		// but the branching state will.
+		boolean valuesChanged = super.merge(frame, interpreter);
+		boolean branchingChanged = branchStateChanged;
+		branchStateChanged = false;
+		return valuesChanged || branchingChanged;
 	}
 
 	private void updateLocalAndStackSnapshots() {
@@ -250,7 +260,9 @@ public class ReFrame extends Frame<ReValue> {
 			ReValue stack = getStack(i);
 			if (stack == existing) {
 				setStack(i, replacement);
-			} else if (stack instanceof ArrayValue stackArray) {
+			} else if (stack instanceof ArrayValue stackArray
+					&& (existing instanceof ArrayValue ? stackArray.containsTrackedSubArray() : true)
+					&& stackArray.canStore(replacement, true)) {
 				ArrayValue updatedStackArray = stackArray.updatedCopyIfContained(existing, replacement);
 				setStack(i, updatedStackArray);
 			}
@@ -259,7 +271,9 @@ public class ReFrame extends Frame<ReValue> {
 			ReValue local = getLocal(i);
 			if (local == existing) {
 				setLocal(i, replacement);
-			} else if (local instanceof ArrayValue stackArray) {
+			} else if (local instanceof ArrayValue stackArray
+					&& (existing instanceof ArrayValue ? stackArray.containsTrackedSubArray() : true)
+					&& stackArray.canStore(replacement, true)) {
 				ArrayValue updatedStackArray = stackArray.updatedCopyIfContained(existing, replacement);
 				setLocal(i, updatedStackArray);
 			}
@@ -286,6 +300,7 @@ public class ReFrame extends Frame<ReValue> {
 	 * 		Branching behavior observed in this frame.
 	 */
 	protected void addBranchingBehavior(@Nonnull Branching branching) {
+		Branching previousState = branchState;
 		if (branchState == null)
 			branchState = branching;
 		else if (branching == Branching.UNKNOWN)
@@ -294,6 +309,8 @@ public class ReFrame extends Frame<ReValue> {
 			branchState = Branching.UNKNOWN;
 		else if (branchState == Branching.NOT_TAKEN && branching == Branching.TAKEN)
 			branchState = Branching.UNKNOWN;
+		if (previousState != branchState)
+			branchStateChanged = true;
 	}
 
 	/**

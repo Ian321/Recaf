@@ -105,6 +105,7 @@ public class JavacCompiler implements Service {
 		String className = arguments.getClassName(); // This is primarily used for logging, there's no other special treatment.
 		Map<String, String> classSources = arguments.getClassSources();
 		Set<String> sourceClassNames = classSources.keySet();
+		int target = arguments.getVersionTarget();
 
 		// Class input map
 		VirtualUnitMap unitMap = new VirtualUnitMap();
@@ -127,7 +128,7 @@ public class JavacCompiler implements Service {
 					.collect(Collectors.toList());
 			if (!classesToScan.isEmpty()) {
 				try {
-					WorkspaceResource phantomResource = phantomGenerator.createPhantomsForClasses(workspace, classesToScan);
+					WorkspaceResource phantomResource = phantomGenerator.createPhantomsForClasses(workspace, classesToScan, target);
 					int generatedCount = phantomResource.getJvmClassBundle().size();
 					if (generatedCount > 0) {
 						logger.debug("Generated {} phantoms for pre-compile", generatedCount);
@@ -143,7 +144,6 @@ public class JavacCompiler implements Service {
 		JavacListener listenerWrapper = createRecordingListener(listener, diagnostics);
 		JavaFileManager fmFallback = compiler.getStandardFileManager(listenerWrapper, Locale.getDefault(), UTF_8);
 		String cp = arguments.getClassPath();
-		int target = arguments.getVersionTarget();
 		JavaFileManager fm = new VirtualFileManager(classpathCache, unitMap, virtualClassPath, fmFallback, cp, target);
 
 		// Populate arguments

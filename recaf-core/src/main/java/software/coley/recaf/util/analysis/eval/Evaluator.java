@@ -53,8 +53,10 @@ import software.coley.recaf.workspace.model.resource.RuntimeWorkspaceResource;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
@@ -77,6 +79,7 @@ public class Evaluator {
 	private final boolean evaluateInternals;
 	private final boolean evaluateClassInitializers;
 	private final int maxSteps;
+	private final Map<String, ClassNode> classNodeOverrides = new ConcurrentHashMap<>();
 	private List<ClassMethodPair> callStackSeed;
 
 	/**
@@ -103,6 +106,27 @@ public class Evaluator {
 		this.maxSteps = maxSteps;
 		this.evaluateInternals = evaluateInternals;
 		this.evaluateClassInitializers = evaluateClassInitializers;
+	}
+
+	/**
+	 * Registers a class node to override a definition from the workspace.
+	 * This allows evaluation of transformed or synthetic classes before they are inserted into the workspace.
+	 *
+	 * @param node
+	 * 		Class to register.
+	 */
+	public void registerClassNodeOverride(@Nonnull ClassNode node) {
+		classNodeOverrides.put(node.name, node);
+	}
+
+	/**
+	 * @return Mutable map of class-node overrides. These values are used over what currently exists in the {@link Workspace}.
+	 *
+	 * @see #registerClassNodeOverride(ClassNode)
+	 */
+	@Nonnull
+	public Map<String, ClassNode> getClassNodeOverrides() {
+		return classNodeOverrides;
 	}
 
 	/**
@@ -136,6 +160,17 @@ public class Evaluator {
 	public boolean canEvaluate(@Nonnull String className,
 	                           @Nonnull String methodName,
 	                           @Nonnull String methodDescriptor) {
+		// Find class in the per-evaluation overrides.
+		ClassNode override = classNodeOverrides.get(className);
+		if (override != null) {
+			for (MethodNode methodNode : override.methods)
+				if (methodName.equals(methodNode.name) && methodDescriptor.equals(methodNode.desc))
+					return !AccessFlag.isAbstract(methodNode.access)
+							&& !AccessFlag.isNative(methodNode.access)
+							&& canEvaluate(methodNode);
+			return false;
+		}
+
 		// Find class in workspace.
 		ClassPathNode classPath = workspace.findClass(evaluateInternals, className);
 		if (classPath == null)
@@ -235,6 +270,36 @@ public class Evaluator {
 	}
 
 	/**
+	 * Special case evaluation for {@code <clinit>} methods.
+	 *
+	 * @param node
+	 * 		Current class node whose initializer should be evaluated.
+	 *
+	 * @return Initializer result.
+	 * <ul>
+	 * <li>A successful initialization yields an {@link EvaluationYieldResult} wrapping {@link UninitializedValue#UNINITIALIZED_VALUE}.</li>
+	 * <li>An evaluated thrown exception yields an {@link EvaluationThrowsResult}.</li>
+	 * <li>Unsupported or unknown execution yields an {@link EvaluationFailureResult}.</li>
+	 * </ul>
+	 */
+	@Nonnull
+	public EvaluationResult evaluateClassInitializer(@Nonnull ClassNode node) {
+		// Refuse the explicit entry point when initializer evaluation was not opted into.
+		if (!evaluateClassInitializers)
+			return EvaluationResult.cannotEvaluate("Class initializer evaluation is disabled");
+
+		// Register the supplied node before creating the context so every nested lookup sees this current bytecode.
+		registerClassNodeOverride(node);
+
+		// Preserve the caller's current class state while nested classes continue to resolve from the workspace.
+		EvaluationContext context = new EvaluationContext(this, maxSteps, callStackSeed);
+		EvaluationResult result = initializeClassIfNeeded(node.name, context);
+		return result == null
+				? new EvaluationYieldResult(UninitializedValue.UNINITIALIZED_VALUE)
+				: result;
+	}
+
+	/**
 	 * @param className
 	 * 		Name of class defining the target method.
 	 * @param methodName
@@ -271,22 +336,31 @@ public class Evaluator {
 	                                  @Nullable ObjectValue classInstance,
 	                                  @Nonnull List<ReValue> parameters,
 	                                  @Nonnull EvaluationContext context) throws UnknownValueException {
-		ClassPathNode classPath = workspace.findClass(evaluateInternals, className);
-		if (classPath == null)
-			return EvaluationResult.cannotEvaluate("Class not found in workspace: " + className);
+		// Get the class node from the workspace or the per-evaluation override.
+		ClassNode classNode = context.classNodeOverrides.get(className);
+		if (classNode == null)
+			classNode = context.workspaceNodeCache.get(className);
+		if (classNode == null) {
+			ClassPathNode classPath = workspace.findClass(evaluateInternals, className);
+			if (classPath == null)
+				return EvaluationResult.cannotEvaluate("Class not found in workspace: " + className);
 
-		JvmClassInfo classInfo = classPath.getValue().asJvmClass();
-		if (classInfo.getDeclaredMethod(methodName, methodDescriptor) == null)
-			return EvaluationResult.cannotEvaluate("Method not found in class: " + className + "." + methodName + methodDescriptor);
+			JvmClassInfo classInfo = classPath.getValue().asJvmClass();
+			if (classInfo.getDeclaredMethod(methodName, methodDescriptor) == null)
+				return EvaluationResult.cannotEvaluate("Method not found in class: " + className + "." + methodName + methodDescriptor);
 
-		ClassNode classNode = new ClassNode();
-		ClassReader reader = classInfo.getClassReader();
-		reader.accept(classNode, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+			classNode = new ClassNode();
+			ClassReader reader = classInfo.getClassReader();
+			reader.accept(classNode, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+			context.workspaceNodeCache.put(className, classNode);
+		}
 
+		// Find the method node in the class node and evaluate it.
 		for (MethodNode methodNode : classNode.methods)
 			if (methodName.equals(methodNode.name) && methodDescriptor.equals(methodNode.desc))
 				return evaluate(classNode, methodNode, classInstance, parameters, context);
 
+		// Failed to find the method in the node model. Generally shouldn't happen.
 		return EvaluationResult.cannotEvaluate("Method exists in class model, but not in tree node representation");
 	}
 
@@ -490,8 +564,9 @@ public class Evaluator {
 	 */
 	@Nullable
 	private EvaluationResult initializeClassIfNeeded(@Nonnull String className, @Nonnull EvaluationContext context) {
-		// Skip if we aren't evaluating class initializers or the class is not in the workspace.
-		if (!evaluateClassInitializers || workspace.findClass(evaluateInternals, className) == null)
+		// Skip if initializer evaluation is disabled.
+		// A supplied root node may be outside the workspace, so only require a workspace class when no per-evaluation override exists.
+		if (!evaluateClassInitializers || (context.classNodeOverrides.get(className) == null && workspace.findClass(evaluateInternals, className) == null))
 			return null;
 
 		// Skip if the class has already been initialized in this evaluation.
@@ -509,7 +584,7 @@ public class Evaluator {
 			return null;
 
 		try {
-			ClassNode classNode = getNode(className);
+			ClassNode classNode = getNode(className, context);
 			if (classNode == null)
 				return null;
 
@@ -683,7 +758,7 @@ public class Evaluator {
 		return switch (branching) {
 			case TAKEN -> ((JumpInsnNode) insn).label;
 			case NOT_TAKEN -> insn.getNext();
-			case UNKNOWN -> throw UnknownValueException.INSTANCE;
+			case UNKNOWN -> throw UnknownValueException.get();
 		};
 	}
 
@@ -716,7 +791,7 @@ public class Evaluator {
 	private IntValue requireKnownInt(@Nonnull ReValue value) throws UnknownValueException {
 		if (value instanceof IntValue intValue && intValue.hasKnownValue())
 			return intValue;
-		throw UnknownValueException.INSTANCE;
+		throw UnknownValueException.get();
 	}
 
 	/**
@@ -732,7 +807,7 @@ public class Evaluator {
 	private ObjectValue requireKnownNullness(@Nonnull ReValue value) throws UnknownValueException {
 		if (value instanceof ObjectValue objectValue && objectValue.nullness() != Nullness.UNKNOWN)
 			return objectValue;
-		throw UnknownValueException.INSTANCE;
+		throw UnknownValueException.get();
 	}
 
 	/**
@@ -797,17 +872,39 @@ public class Evaluator {
 				return Branching.NOT_TAKEN;
 		}
 
-		throw UnknownValueException.INSTANCE;
+		throw UnknownValueException.get();
 	}
 
 	/**
 	 * @param className
 	 * 		Internal name of the class to get.
 	 *
-	 * @return Class node for the given class, or {@code null} if the class is not in the workspace.
+	 * @return Class node for the given class, or {@code null} if it is unavailable.
 	 */
 	@Nullable
 	private ClassNode getNode(@Nonnull String className) {
+		return getNode(className, null);
+	}
+
+	/**
+	 * @param className
+	 * 		Internal name of the class to get.
+	 * @param context
+	 * 		Evaluation context containing any class overrides.
+	 * 		Evaluator-scope overrides will be used when passing {@code null}.
+	 *
+	 * @return Class node for the given class, or {@code null} if it is unavailable.
+	 */
+	@Nullable
+	private ClassNode getNode(@Nonnull String className, @Nullable EvaluationContext context) {
+		// Prefer the evaluation snapshot so nested calls use overrides from the current evaluation.
+		ClassNode override = context == null
+				? classNodeOverrides.get(className)
+				: context.classNodeOverrides.get(className);
+		if (override != null)
+			return override;
+
+		// Find the class in the workspace and parse it into a node.
 		ClassPathNode classPath = workspace.findClass(evaluateInternals, className);
 		if (classPath == null)
 			return null;
@@ -820,15 +917,45 @@ public class Evaluator {
 	/**
 	 * @param className
 	 * 		Internal name of the class to check.
+	 * @param context
+	 * 		Evaluation context containing any class overrides.
+	 * 		Evaluator-scope overrides will be used when passing {@code null}.
 	 *
 	 * @return {@code true} if the class is concrete <i>(not abstract or an interface)</i> and can be instantiated.
 	 */
-	private boolean isConcreteClass(@Nonnull String className) {
+	private boolean isConcreteClass(@Nonnull String className, @Nullable EvaluationContext context) {
+		// Check the override snapshot first.
+		ClassNode override = context == null
+				? classNodeOverrides.get(className)
+				: context.classNodeOverrides.get(className);
+		if (override != null)
+			return !AccessFlag.isAbstract(override.access) && !AccessFlag.isInterface(override.access);
+
+		// Check the workspace for a concrete class.
 		ClassPathNode classPath = workspace.findClass(evaluateInternals, className);
 		if (classPath == null)
 			return false;
 		int access = classPath.getValue().asJvmClass().getAccess();
 		return !AccessFlag.isAbstract(access) && !AccessFlag.isInterface(access);
+	}
+
+	/**
+	 * Checks whether a class is available through the current evaluation snapshot or the workspace.
+	 *
+	 * @param className
+	 * 		Internal class name to check.
+	 * @param context
+	 * 		Evaluation context containing any class overrides.
+	 * 		Evaluator-scope overrides will be used when passing {@code null}.
+	 *
+	 * @return {@code true} when the class can be resolved.
+	 */
+	private boolean hasClass(@Nonnull String className, @Nullable EvaluationContext context) {
+		if (context != null && context.classNodeOverrides.containsKey(className))
+			return true;
+		if (context == null && classNodeOverrides.containsKey(className))
+			return true;
+		return workspace.findClass(evaluateInternals, className) != null;
 	}
 
 	/**
@@ -861,16 +988,19 @@ public class Evaluator {
 	 * @param receiverType
 	 * 		Internal name of the receiver class when the receiver is known to be {@code this},
 	 * 		or {@code null} when that attribution is unavailable.
+	 * @param context
+	 * 		Evaluation context containing the class-node override snapshot.
 	 *
 	 * @return Resolved method, or {@code null} if no concrete, unambiguous workspace implementation is available.
 	 */
 	@Nullable
 	private ClassMethodPair resolveMethod(@Nonnull MethodInsnNode instruction,
 	                                      @Nonnull ReValue receiver,
-	                                      @Nullable String receiverType) {
+	                                      @Nullable String receiverType,
+	                                      @Nonnull EvaluationContext context) {
 		// Special calls use the symbolic owner exactly. No special resolution needed.
 		if (instruction.getOpcode() == Opcodes.INVOKESPECIAL)
-			return resolveConcreteMethod(getNode(instruction.owner), instruction.name, instruction.desc);
+			return resolveConcreteMethod(getNode(instruction.owner, context), instruction.name, instruction.desc);
 
 		// Virtual and interface calls use the receiver's concrete type when available, otherwise the symbolic owner.
 		// First get the receiver's concrete type, if it is known.
@@ -883,7 +1013,7 @@ public class Evaluator {
 		Set<String> visitedClasses = new HashSet<>();
 		String className = receiverClassName;
 		while (className != null && visitedClasses.add(className)) {
-			ClassNode classNode = getNode(className);
+			ClassNode classNode = getNode(className, context);
 			if (classNode == null)
 				break;
 
@@ -902,13 +1032,13 @@ public class Evaluator {
 		Set<String> interfaceClassChain = new HashSet<>();
 		className = receiverClassName;
 		while (className != null && interfaceClassChain.add(className)) {
-			ClassNode classNode = getNode(className);
+			ClassNode classNode = getNode(className, context);
 			if (classNode == null)
 				break;
 
 			// Collect concrete implementations of the method in this class's interfaces and their parents.
 			for (String interfaceName : classNode.interfaces)
-				collectInterfaceMethods(interfaceName, instruction, visitedInterfaces, interfaceMethods);
+				collectInterfaceMethods(interfaceName, instruction, visitedInterfaces, interfaceMethods, context);
 
 			className = classNode.superName;
 		}
@@ -953,16 +1083,19 @@ public class Evaluator {
 	 * @param visited
 	 * 		Set of visited interfaces to avoid cycles.
 	 * @param methods
-	 * 		Result list to add any found concrete methods to.
+	 * 		Result list to add any found implementations to.
+	 * @param context
+	 * 		Evaluation context containing the class-node override snapshot.
 	 */
 	private void collectInterfaceMethods(@Nonnull String interfaceName, @Nonnull MethodInsnNode instruction,
-	                                     @Nonnull Set<String> visited, @Nonnull List<ClassMethodPair> methods) {
+	                                     @Nonnull Set<String> visited, @Nonnull List<ClassMethodPair> methods,
+	                                     @Nonnull EvaluationContext context) {
 		// Skip visited to avoid cycles.
 		if (!visited.add(interfaceName))
 			return;
 
-		// Must be a known interface in the workspace.
-		ClassNode interfaceNode = getNode(interfaceName);
+		// Must be a known interface in the workspace or override snapshot.
+		ClassNode interfaceNode = getNode(interfaceName, context);
 		if (interfaceNode == null)
 			return;
 
@@ -973,7 +1106,7 @@ public class Evaluator {
 
 		// Continue looking in the parent interfaces.
 		for (String parentName : interfaceNode.interfaces)
-			collectInterfaceMethods(parentName, instruction, visited, methods);
+			collectInterfaceMethods(parentName, instruction, visited, methods, context);
 	}
 
 	/**
@@ -1190,7 +1323,7 @@ public class Evaluator {
 						(context.models.supportsAllocation(tin.desc)
 								|| instanceFactory.isSupportedType(tin.desc)
 								|| exceptionHandler.isThrowableType(tin.desc)
-								|| isConcreteClass(tin.desc));
+								|| isConcreteClass(tin.desc, context));
 				case INVOKESPECIAL, INVOKEINTERFACE, INVOKEVIRTUAL -> {
 					if (insn instanceof MethodInsnNode min) {
 						// Object initializer is no-op and inherently safe to evaluate.
@@ -1198,9 +1331,11 @@ public class Evaluator {
 								&& min.name.equals("<init>") && min.desc.equals("()V"))
 							yield true;
 
-						// Check if the method is a known exception constructor or stack trace getter.
+						// Check if the method is a known exception constructor, stack trace getter, or logger.
 						// These are special cases in our evaluation engine and are safe to evaluate.
-						if (exceptionHandler.isThrowableConstructor(min) || exceptionHandler.isThrowableGetStackTrace(min))
+						if (exceptionHandler.isThrowableConstructor(min)
+								|| exceptionHandler.isThrowableGetStackTrace(min)
+								|| exceptionHandler.isThrowablePrintStackTrace(min))
 							yield true;
 
 						// Check if the method is a known constructor supported by one of the model types.
@@ -1220,8 +1355,7 @@ public class Evaluator {
 							yield true;
 
 						// Check if the symbolic owner exists for runtime receiver dispatch.
-						ClassPathNode targetClassPath = workspace.findClass(evaluateInternals, min.owner);
-						if (targetClassPath != null)
+						if (hasClass(min.owner, context))
 							yield true;
 
 						// Check if we have a value lookup for the method.
@@ -1246,9 +1380,8 @@ public class Evaluator {
 						if (instanceFactory.getMapper(min) != null)
 							yield true;
 
-						// Check if the method is declared in the workspace, meaning we can evaluate it.
-						ClassPathNode targetClassPath = workspace.findClass(evaluateInternals, min.owner);
-						if (targetClassPath != null)
+						// Check if the method is declared in the workspace or an override, meaning we can evaluate it.
+						if (hasClass(min.owner, context))
 							yield true;
 
 						// Check if we have a value lookup for the method.
@@ -1425,7 +1558,7 @@ public class Evaluator {
 				}
 				case GETSTATIC -> {
 					if (insn instanceof FieldInsnNode fieldInsn) {
-						// GETSTATIC is a JVM active-use boundary,so run static initialization before cache lookup.
+						// GETSTATIC is a JVM active-use boundary, so run static initialization before cache lookup.
 						EvaluationResult initializationResult = initializeClassIfNeeded(fieldInsn.owner, context);
 						if (initializationResult instanceof EvaluationFailureResult failure)
 							throw new NestedEvaluationFailure(failure);
@@ -1442,6 +1575,13 @@ public class Evaluator {
 										.setField(fieldInsn.owner, fieldInsn.name, fieldInsn.desc, v);
 							});
 							push(value);
+							yield insn.getNext();
+						}
+
+						// Check if the field is modeled by the instance factory, which can handle some special cases.
+						ReValue modeled = instanceFactory.getStaticFieldValue(fieldInsn);
+						if (modeled != null) {
+							push(modeled);
 							yield insn.getNext();
 						}
 
@@ -1534,7 +1674,7 @@ public class Evaluator {
 								? currentClassName : null;
 
 						// Resolve the method to evaluate, preferring the receiver type when available, and falling back to the current class.
-						ClassMethodPair resolvedMethod = resolveMethod(min, receiver, resolutionClassName);
+						ClassMethodPair resolvedMethod = resolveMethod(min, receiver, resolutionClassName, context);
 						if (resolvedMethod != null) {
 							EvaluationResult result = Evaluator.this.evaluate(resolvedMethod.classNode(), resolvedMethod.methodNode(),
 									receiver, valueList, context);
@@ -1550,7 +1690,7 @@ public class Evaluator {
 								case EvaluationFailureResult failure -> throw new NestedEvaluationFailure(failure);
 							}
 						}
-						if (isWorkspaceClass(receiver, resolutionClassName))
+						if (isWorkspaceClass(receiver, resolutionClassName, context))
 							throw new NestedEvaluationFailure(EvaluationResult.cannotEvaluate(
 									"Invoke-special call could not be resolved: " + min.owner + '.' + min.name + min.desc));
 
@@ -1638,7 +1778,7 @@ public class Evaluator {
 								? currentClassName : null;
 
 						// Resolve the method to evaluate, preferring the receiver type when available, and falling back to the current class.
-						ClassMethodPair resolvedMethod = resolveMethod(min, receiver, resolutionClassName);
+						ClassMethodPair resolvedMethod = resolveMethod(min, receiver, resolutionClassName, context);
 						if (resolvedMethod != null) {
 							EvaluationResult result = Evaluator.this.evaluate(resolvedMethod.classNode(), resolvedMethod.methodNode(),
 									receiver, valueList, context);
@@ -1656,7 +1796,7 @@ public class Evaluator {
 							}
 						}
 
-						if (isWorkspaceClass(receiver, resolutionClassName))
+						if (isWorkspaceClass(receiver, resolutionClassName, context))
 							throw new NestedEvaluationFailure(EvaluationResult.cannotEvaluate(
 									"Invoke-Virtual/Interface call could not be resolved: " + min.owner + '.' + min.name + min.desc));
 
@@ -1885,22 +2025,25 @@ public class Evaluator {
 
 		/**
 		 * Checks whether an unresolved instance call supposedly should exist in the workspace.
-		 * This is called after {@link #resolveMethod(MethodInsnNode, ReValue, String)}, which means
+		 * This is called after {@link #resolveMethod(MethodInsnNode, ReValue, String, EvaluationContext)}, which means
 		 * we only call this after a resolution attempt has failed.
 		 *
 		 * @param receiver
 		 * 		Receiver of the unresolved instance call.
 		 * @param currentClassName
 		 * 		Current workspace class when the receiver is known to be {@code this}, or {@code null}.
+		 * @param context
+		 * 		Evaluation context containing the class-node override snapshot.
 		 *
-		 * @return {@code true} when the receiver is a class defined in the workspace,
+		 * @return {@code true} when the receiver is a class defined in the workspace or override snapshot,
 		 * and so the unresolved call must be treated as a conservative failure.
 		 */
-		private boolean isWorkspaceClass(@Nonnull ReValue receiver, @Nullable String currentClassName) {
+		private boolean isWorkspaceClass(@Nonnull ReValue receiver, @Nullable String currentClassName,
+		                                 @Nonnull EvaluationContext context) {
 			if (receiver instanceof InstancedObjectValue<?> instanced
-					&& workspace.findClass(evaluateInternals, instanced.type().getInternalName()) != null)
+					&& hasClass(instanced.type().getInternalName(), context))
 				return true;
-			return currentClassName != null && workspace.findClass(evaluateInternals, currentClassName) != null;
+			return currentClassName != null && hasClass(currentClassName, context);
 		}
 
 		@Nonnull
@@ -1953,6 +2096,11 @@ public class Evaluator {
 	/** Dummy exception to signal an unknown branch decision. */
 	public static final class UnknownValueException extends Exception {
 		private static final UnknownValueException INSTANCE = new UnknownValueException();
+
+		@Nonnull
+		public static UnknownValueException get() {
+			return INSTANCE;
+		}
 
 		private UnknownValueException() {}
 

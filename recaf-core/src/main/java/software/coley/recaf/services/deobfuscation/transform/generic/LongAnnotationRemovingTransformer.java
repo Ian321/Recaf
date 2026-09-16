@@ -8,10 +8,13 @@ import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.services.transform.JvmClassTransformer;
 import software.coley.recaf.services.transform.JvmTransformerContext;
 import software.coley.recaf.services.transform.TransformationException;
+import software.coley.recaf.services.transform.TransformationParameter;
 import software.coley.recaf.util.visitors.LongAnnotationRemovingVisitor;
 import software.coley.recaf.workspace.model.Workspace;
 import software.coley.recaf.workspace.model.bundle.JvmClassBundle;
 import software.coley.recaf.workspace.model.resource.WorkspaceResource;
+
+import java.util.List;
 
 /**
  * A transformer that removes any invalid annotations from classes and any of their declared members.
@@ -20,15 +23,18 @@ import software.coley.recaf.workspace.model.resource.WorkspaceResource;
  */
 @Dependent
 public class LongAnnotationRemovingTransformer implements JvmClassTransformer {
-	/** Key for the annotation length threshold. */
-	public static final String KEY_LONG_ANNO = "long-annotation-removing.long-anno";
-	private static final int DEFAULT_LONG_ANNO = 150;
+	public static final String IDENTIFIER = "cleanup.longanno";
 
-	private int longAnno;
+	public static final String KEY_MAX_LENGTH = IDENTIFIER + ".max-length";
+	private static final int DEFAULT_MAX_LENGTH = 150;
+	private static final TransformationParameter<Integer> MAX_LENGTH_PARAMETER =
+			new TransformationParameter<>(KEY_MAX_LENGTH, int.class, DEFAULT_MAX_LENGTH);
+
+	private int maxLength;
 
 	@Override
 	public void setup(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace) {
-		longAnno = context.getParameters().getInt(KEY_LONG_ANNO, DEFAULT_LONG_ANNO);
+		maxLength = context.getParameters().getInt(KEY_MAX_LENGTH, DEFAULT_MAX_LENGTH);
 	}
 
 	@Override
@@ -39,7 +45,7 @@ public class LongAnnotationRemovingTransformer implements JvmClassTransformer {
 		ClassReader reader = new ClassReader(context.getBytecode(bundle, initialClassState));
 		ClassWriter writer = new ClassWriter(reader, 0);
 
-		LongAnnotationRemovingVisitor remover = new LongAnnotationRemovingVisitor(writer, longAnno);
+		LongAnnotationRemovingVisitor remover = new LongAnnotationRemovingVisitor(writer, maxLength);
 		reader.accept(remover, initialClassState.getClassReaderFlags());
 
 		// If the visitor did work, update the class.
@@ -49,8 +55,14 @@ public class LongAnnotationRemovingTransformer implements JvmClassTransformer {
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Long annotation removal";
+	public String identifier() {
+		return IDENTIFIER;
+	}
+
+	@Nonnull
+	@Override
+	public List<TransformationParameter<?>> getParameterDefinitions() {
+		return List.of(MAX_LENGTH_PARAMETER);
 	}
 
 	@Override

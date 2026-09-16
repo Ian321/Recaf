@@ -24,6 +24,8 @@ import software.coley.recaf.workspace.model.resource.WorkspaceResource;
  */
 @Dependent
 public class UnknownAttributeRemovingTransformer implements JvmClassTransformer {
+	public static final String IDENTIFIER = "cleanup.unknownattr";
+
 	@Override
 	public void transform(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace,
 	                      @Nonnull WorkspaceResource resource, @Nonnull JvmClassBundle bundle,
@@ -52,8 +54,8 @@ public class UnknownAttributeRemovingTransformer implements JvmClassTransformer 
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Unknown attribute removal";
+	public String identifier() {
+		return IDENTIFIER;
 	}
 
 	@Override

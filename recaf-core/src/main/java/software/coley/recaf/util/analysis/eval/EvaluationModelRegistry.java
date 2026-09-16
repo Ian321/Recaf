@@ -26,7 +26,7 @@ public final class EvaluationModelRegistry {
 	private final List<EvaluatorModel> models;
 
 	EvaluationModelRegistry(@Nonnull Evaluator evaluator) {
-		models = List.of(new ThreadModel(evaluator), new CompletableFutureModel(), new TimeModel());
+		models = List.of(new ThreadModel(evaluator), new CompletableFutureModel(), new TimeModel(), new EnumModel(evaluator));
 	}
 
 	/**

@@ -4,15 +4,19 @@ import jakarta.annotation.Nonnull;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ConstantDynamic;
 import org.objectweb.asm.Handle;
+import org.objectweb.asm.Label;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import org.objectweb.asm.TypeReference;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
+import org.objectweb.asm.tree.LocalVariableNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TryCatchBlockNode;
 import software.coley.recaf.info.JvmClassInfo;
@@ -138,6 +142,52 @@ class PhantomGeneratorTest extends CompilerTestBase implements Opcodes {
 	}
 
 	@Test
+	void testKnownSuperclassConstructorDescriptor() {
+		// A generated subclass must call a constructor that actually exists on a known parent.
+		JvmClassInfo knownParent = assemble("""
+				.super java/lang/Object
+				.class public super KnownConstructorParent {
+				    .method protected <init> (I)V {
+				        code: {
+				        A:
+				            aload this
+				            invokespecial java/lang/Object.<init> ()V
+				            return
+				        B:
+				        }
+				    }
+				    .method public use ()V {
+				        code: {
+				        A:
+				            return
+				        B:
+				        }
+				    }
+				}
+				""", true);
+		JvmClassInfo input = assemble("""
+				.super java/lang/Object
+				.class public super KnownConstructorUse {
+				    .method public static example ()V {
+				        code: {
+				        A:
+				            new MissingConstructorChild
+				            dup
+				            invokespecial MissingConstructorChild.<init> ()V
+				            invokevirtual KnownConstructorParent.use ()V
+				            return
+				        B:
+				        }
+				    }
+				}
+				""", true);
+		Workspace workspace = TestClassUtils.fromBundle(TestClassUtils.fromClasses(knownParent));
+		GeneratedPhantomWorkspaceResource phantoms = assertDoesNotThrow(() -> generator.createPhantomsForClasses(workspace, List.of(input)));
+		JvmClassInfo child = assertHasPhantom(phantoms.getJvmClassBundle(), "MissingConstructorChild");
+		assertNotNull(child.getDeclaredMethod("<init>", "()V"));
+	}
+
+	@Test
 	void testMemberInsnReferences() {
 		// class MemberInferenceExample {
 		//     public static void example(MissingClass obj, MissingInterface iface) {
@@ -198,6 +248,32 @@ class PhantomGeneratorTest extends CompilerTestBase implements Opcodes {
 		assertFalse(interfaceMethod.hasStaticModifier());
 		assertTrue(interfaceMethod.hasAbstractModifier());
 		assertTrue(interfaceStaticMethod.hasStaticModifier());
+	}
+
+	@Test
+	void testSpecialMemberInsnReference() {
+		// void example(MissingSource param) {
+		//     ((MissingTarget) param).privateCall();
+		// }
+		JvmClassInfo input = assemble("""
+				.super java/lang/Object
+				.class public super InvokeSpecialReceiverExample {
+				    .method public static example (LMissingSource;)V {
+				        parameters: { source },
+				        code: {
+				        A:
+				            aload source
+				            invokespecial MissingTarget.privateCall ()V
+				            return
+				        B:
+				        }
+				    }
+				}
+				""", true);
+
+		// Using invokespecial on an unknown receiver type should infer that the receiver type is a subclass of the method owner type.
+		JvmClassBundle phantomBundle = generatePhantoms(input).getJvmClassBundle();
+		assertEquals("MissingTarget", assertHasPhantom(phantomBundle, "MissingSource").getSuperName());
 	}
 
 	@Test
@@ -335,6 +411,72 @@ class PhantomGeneratorTest extends CompilerTestBase implements Opcodes {
 	}
 
 	@Test
+	void testEnumAnnotationReference() {
+		// @EnumAnnotationCarrier(mode = MissingMode.ENABLED)
+		JvmClassInfo input = assemble("""
+				.visible-annotation MissingAnnotation {
+				    mode: .enum MissingMode ENABLED
+				}
+				.super java/lang/Object
+				.class public super EnumAnnotationCarrier {
+				}
+				""", true);
+
+		// Annotations referencing enums should generate the enum type and its constants.
+		GeneratedPhantomWorkspaceResource phantoms = generatePhantoms(input);
+		JvmClassInfo mode = assertHasPhantom(phantoms.getJvmClassBundle(), "MissingMode");
+		assertTrue(mode.hasEnumModifier());
+		assertNotNull(mode.getDeclaredField("ENABLED", "LMissingMode;"));
+
+		// We should be able to use the enum in source now.
+		compileWithPhantoms("EnumAnnotationUse", """
+				@MissingAnnotation(mode = MissingMode.ENABLED)
+				class EnumAnnotationUse {
+				}
+				""", phantoms);
+	}
+
+	@Test
+	void testJetBrainsLocalVariableAnnotationReference() {
+		// Contrived case where you have a @NotNull annotation on a local variable.
+		// People really put this shit on variables. I get it, but man. Type annotations are such cringe.
+		JvmClassInfo input = TestClassUtils.createClass("JetBrainsLocalAnnotationExample", node -> {
+			MethodNode method = new MethodNode(ACC_PUBLIC | ACC_STATIC, "example", "()V", null, null);
+			LabelNode start = new LabelNode();
+			LabelNode end = new LabelNode();
+			method.instructions.add(start);
+			method.visitInsn(RETURN);
+			method.instructions.add(end);
+			method.localVariables.add(new LocalVariableNode("value", "Ljava/lang/String;", null, start, end, 0));
+			AnnotationVisitor annotation = method.visitLocalVariableAnnotation(
+					TypeReference.newTypeReference(TypeReference.LOCAL_VARIABLE).getValue(),
+					null, new Label[]{start.getLabel()}, new Label[]{end.getLabel()}, new int[]{0},
+					"Lorg/jetbrains/annotations/NotNull;", true);
+			annotation.visitEnd();
+			node.methods.add(method);
+		});
+
+		// Anyways, we should be able to generate the @NotNull annotation as a phantom.
+		JvmClassBundle phantomBundle = generatePhantoms(input).getJvmClassBundle();
+		JvmClassInfo annotation = assertHasPhantom(phantomBundle, "org/jetbrains/annotations/NotNull");
+		assertTrue(annotation.hasAnnotationModifier());
+	}
+
+	@Test
+	void testJetBrainsRecordComponentAnnotationReference() {
+		// Same annotation as above, but on a more normal case like a record component.
+		JvmClassInfo input = assemble("""
+				.super java/lang/Record
+				.visible-annotation org/jetbrains/annotations/NotNull {
+				}
+				.record-component value Ljava/lang/String;
+				.class public super record JetBrainsRecordAnnotationExample {
+				}
+				""", true);
+		assertHasPhantom(generatePhantoms(input).getJvmClassBundle(), "org/jetbrains/annotations/NotNull");
+	}
+
+	@Test
 	void testReferencedKnownTypeHierarchy() {
 		// Create two types:
 		//  - KnownChild implements MissingParentInterface
@@ -356,6 +498,77 @@ class PhantomGeneratorTest extends CompilerTestBase implements Opcodes {
 	}
 
 	@Test
+	void testInstructionReferenceFollowingFindsAnnoOnMethod() {
+		// interface KnownAnnotatedOwner { @NotNull void run() {} }
+		JvmClassInfo knownOwner = assemble("""
+				.super java/lang/Object
+				.class public abstract interface KnownAnnotatedOwner {
+				    .visible-annotation org/jetbrains/annotations/NotNull {
+				    }
+				    .method public abstract run ()V {
+				    }
+				}
+				""", true);
+
+		// class KnownOwnerUse { void example() { KnownAnnotatedOwner.run(); } }
+		JvmClassInfo input = assemble("""
+				.super java/lang/Object
+				.class public super KnownOwnerUse {
+				    .method public static example ()V {
+				        code: {
+				        A:
+				            aconst_null
+				            invokeinterface KnownAnnotatedOwner.run ()V
+				            return
+				        B:
+				        }
+				    }
+				}
+				""", true);
+
+		// When we analyze phantoms for KnownOwnerUse, the underlying reference following logic
+		// should trigger analysis of KnownAnnotatedOwner, which should result in the @NotNull annotation being generated as a phantom.
+		Workspace workspace = TestClassUtils.fromBundle(TestClassUtils.fromClasses(knownOwner));
+		assertHasPhantom(generatePhantoms(workspace, input).getJvmClassBundle(), "org/jetbrains/annotations/NotNull");
+	}
+
+	@Test
+	void testInstructionReferenceFollowingFindsAnnoOnLocal() {
+		// Same test as above more or less, but the @NotNull annotation is on a local variable instead of a method.
+		// Not super obvious to represent the annotation in JASM for this case...
+		JvmClassInfo knownOwner = TestClassUtils.createClass("KnownLocalAnnotatedOwner", node -> {
+			MethodNode method = new MethodNode(ACC_PUBLIC | ACC_STATIC, "run", "()V", null, null);
+			LabelNode start = new LabelNode();
+			LabelNode end = new LabelNode();
+			method.instructions.add(start);
+			method.visitInsn(RETURN);
+			method.instructions.add(end);
+			method.localVariables.add(new LocalVariableNode("value", "Ljava/lang/String;", null, start, end, 0));
+			AnnotationVisitor annotation = method.visitLocalVariableAnnotation(
+					TypeReference.newTypeReference(TypeReference.LOCAL_VARIABLE).getValue(),
+					null, new Label[]{start.getLabel()}, new Label[]{end.getLabel()}, new int[]{0},
+					"Lorg/jetbrains/annotations/NotNull;", true);
+			annotation.visitEnd();
+			node.methods.add(method);
+		});
+		JvmClassInfo input = assemble("""
+				.super java/lang/Object
+				.class public super KnownLocalAnnotationUse {
+				    .method public static example ()V {
+				        code: {
+				        A:
+				            invokestatic KnownLocalAnnotatedOwner.run ()V
+				            return
+				        B:
+				        }
+				    }
+				}
+				""", true);
+		Workspace workspace = TestClassUtils.fromBundle(TestClassUtils.fromClasses(knownOwner));
+		assertHasPhantom(generatePhantoms(workspace, input).getJvmClassBundle(), "org/jetbrains/annotations/NotNull");
+	}
+
+	@Test
 	void testGenericArityIsRetainedInPhantoms() {
 		// class GenericTypeReference implements MissingProvider<Pair<String, Integer>> { }
 		JvmClassInfo input = TestClassUtils.createClass("GenericTypeReference", node -> {
@@ -374,6 +587,22 @@ class PhantomGeneratorTest extends CompilerTestBase implements Opcodes {
 				.withClassSource("class GenericPairUse { android.util.Pair<String, Integer> value; }")
 				.build(), null, Collections.singletonList(phantoms), null);
 		assertTrue(result.wasSuccess(), () -> "Generic phantom should compile: " + result.getDiagnostics());
+	}
+
+	@Test
+	void testGenericNestedTypeReferencesAreCollected() {
+		// All three referenced types in the signature should be generated:
+		//  - missing/Bound
+		//  - missing/MissingContainer
+		//    - missing/Element
+		JvmClassInfo input = assemble("""
+				.signature "<T:Lmissing/Bound;>Ljava/lang/Object;Lmissing/MissingContainer<Lmissing/Element;>;"
+				.super java/lang/Object
+				.class public super GenericNestedTypeReference {
+				}
+				""", true);
+		JvmClassBundle phantomBundle = generatePhantoms(input).getJvmClassBundle();
+		assertHasPhantoms(phantomBundle, "missing/Bound", "missing/MissingContainer", "missing/Element");
 	}
 
 	@Test
@@ -497,6 +726,8 @@ class PhantomGeneratorTest extends CompilerTestBase implements Opcodes {
 		JvmClassBundle phantomBundle = generatePhantoms(jvmClassInfo).getJvmClassBundle();
 
 		// All referenced types should be created as phantoms, including exception types and dynamic constant types.
+		assertEquals("java/lang/Throwable", assertHasPhantom(phantomBundle, "MissingExceptionType").getSuperName());
+		assertEquals("java/lang/Throwable", assertHasPhantom(phantomBundle, "MissingCatchType").getSuperName());
 		assertHasPhantoms(phantomBundle,
 				"MissingExceptionType",
 				"MissingLdcType",
@@ -619,9 +850,58 @@ class PhantomGeneratorTest extends CompilerTestBase implements Opcodes {
 			node.methods.add(method);
 		});
 		JvmClassBundle phantomBundle = generatePhantoms(jvmClassInfo).getJvmClassBundle();
-		assertHasPhantom(phantomBundle, "MissingFunctionalInterface");
 		JvmClassInfo lambdaOwner = assertHasPhantom(phantomBundle, "MissingLambdaOwner");
+		assertHasPhantom(phantomBundle, "MissingFunctionalInterface");
 		assertNotNull(lambdaOwner.getDeclaredMethod("impl", "()V"));
+	}
+
+	@Test
+	void testIndyArgs() {
+		// Values in invokedynamic arguments should also be visited and infer missing types.
+		JvmClassInfo input = assemble("""
+				.super java/lang/Object
+				.class public super InvokeDynamicArgumentExample {
+				    .method public static example (LMissingSource;)V {
+				        parameters: { source },
+				        code: {
+				        A:
+				            aload source
+				            invokedynamic accept (LMissingTarget;)V { invokestatic, java/lang/invoke/LambdaMetafactory.metafactory, (Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite; } {}
+				            return
+				        B:
+				        }
+				    }
+				}
+				""", true);
+
+		JvmClassBundle phantomBundle = generatePhantoms(input).getJvmClassBundle();
+		assertEquals("MissingTarget", assertHasPhantom(phantomBundle, "MissingSource").getSuperName());
+	}
+
+	@Test
+	void testBootstrapTypesDoNotRequireWorkspaceRuntime() {
+		// If somehow the user makes a workspace with no runtime resource as an internal supporting resource
+		// then we shouldn't end up generating phantoms for JDK classes like 'Object' or 'List'.
+		Workspace workspace = new BasicWorkspace(new WorkspaceResourceBuilder().build(), Collections.emptyList(), false);
+		JvmClassInfo input = assemble("""
+				.super java/lang/Object
+				.class public super NoRuntimeResourceExample {
+				    .method public static use (Ljava/util/List;)Ljava/lang/String; {
+				        parameters: { list },
+				        code: {
+				        A:
+				            aconst_null
+				            areturn
+				        B:
+				        }
+				    }
+				}
+				""", true);
+
+		JvmClassBundle phantomBundle = generatePhantoms(workspace, input).getJvmClassBundle();
+		assertNoPhantom(phantomBundle, "java/lang/Object");
+		assertNoPhantom(phantomBundle, "java/util/List");
+		assertNoPhantom(phantomBundle, "java/lang/String");
 	}
 
 	@Test
@@ -1189,6 +1469,58 @@ class PhantomGeneratorTest extends CompilerTestBase implements Opcodes {
 				""", false).getJvmClassBundle();
 		assertEquals("java/lang/Object", assertHasPhantom(phantomBundle, "CastOnlySub").getSuperName());
 		assertHasPhantom(phantomBundle, "CastOnlySuper");
+	}
+
+	@Test
+	void testTargetVersionSelectsVersionedJvmTypes() throws PhantomGenerationException {
+		// Set up a workspace with a Java 11 versioned bundle/class.
+		JvmClassInfo versionedOwner = assemble("""
+				.super java/lang/Object
+				.class public super VersionedOwner {
+				    .method public static run ()V {
+				        code: {
+				        A:
+				            return
+				        B:
+				        }
+				    }
+				}
+				""", true);
+		BasicVersionedJvmClassBundle versionedBundle = new BasicVersionedJvmClassBundle(11);
+		versionedBundle.initialPut(versionedOwner);
+		NavigableMap<Integer, VersionedJvmClassBundle> versionedBundles = new TreeMap<>();
+		versionedBundles.put(versionedBundle.version(), versionedBundle);
+		Workspace workspace = new BasicWorkspace(new WorkspaceResourceBuilder()
+				.withVersionedJvmClassBundles(versionedBundles)
+				.build());
+
+		// The input class references VersionedOwner, which is only present in the Java 11 versioned bundle.
+		JvmClassInfo input = assemble("""
+				.super java/lang/Object
+				.class public super VersionedTypeUse {
+				    .method public static example ()V {
+				        code: {
+				        A:
+				            invokestatic VersionedOwner.run ()V
+				            return
+				        B:
+				        }
+				    }
+				}
+				""", true);
+
+		// Generating phantoms for Java 8 should create a phantom for VersionedOwner since it's not present in the Java 8 context.
+		// Generating phantoms for Java 11 should not create a phantom since the type is present in the versioned bundle.
+		GeneratedPhantomWorkspaceResource java8Phantoms = generator.createPhantomsForClasses(workspace, List.of(input), 8);
+		assertHasPhantom(java8Phantoms.getJvmClassBundle(), "VersionedOwner");
+		GeneratedPhantomWorkspaceResource java11Phantoms = generator.createPhantomsForClasses(workspace, List.of(input), 11);
+		assertNoPhantom(java11Phantoms.getJvmClassBundle(), "VersionedOwner");
+		JvmClassInfo emitted = assertHasPhantom(generatePhantoms(input).getJvmClassBundle(), "VersionedOwner");
+		assertEquals(52, emitted.getVersion());
+		JvmClassInfo java7Emitted = assertHasPhantom(
+				generator.createPhantomsForClasses(EmptyWorkspace.get(), List.of(input), 7).getJvmClassBundle(),
+				"VersionedOwner");
+		assertEquals(51, java7Emitted.getVersion());
 	}
 
 	@Test

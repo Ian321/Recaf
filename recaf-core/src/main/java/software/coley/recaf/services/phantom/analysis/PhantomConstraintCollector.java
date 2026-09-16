@@ -11,6 +11,7 @@ import org.objectweb.asm.Handle;
 import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.RecordComponentVisitor;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.TypePath;
 import org.objectweb.asm.signature.SignatureReader;
@@ -36,6 +37,7 @@ public class PhantomConstraintCollector {
 	private final PhantomGenerationContext context;
 	private final PhantomMethodConstraintAnalysis methodSubtypeAnalyzer;
 	private final Set<String> visitedKnownClasses = new HashSet<>();
+	private final Set<String> queuedKnownClasses = new HashSet<>();
 	private final Deque<JvmClassInfo> pendingKnownClasses = new ArrayDeque<>();
 
 	/**
@@ -69,7 +71,11 @@ public class PhantomConstraintCollector {
 		int flags = ClassReader.SKIP_FRAMES;
 		if (!followReferences)
 			flags |= ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG;
-		info.getClassReader().accept(new CollectionVisitor(followReferences), flags);
+		info.getClassReader().accept(new CollectionVisitor(followReferences, followReferences), flags);
+
+		// A second narrow pass that retains debug information collects constraints without following references.
+		if (!followReferences)
+			info.getClassReader().accept(new CollectionVisitor(false, false), ClassReader.SKIP_FRAMES);
 
 		// Collect constraints from the methods of the class, if requested.
 		if (followReferences) {
@@ -81,8 +87,8 @@ public class PhantomConstraintCollector {
 	}
 
 	private void queueKnownType(@Nullable String internalName) {
-		// Skip if the type is null or already visited.
-		if (internalName == null || visitedKnownClasses.contains(internalName))
+		// Skip if the type is null, already visited, or already waiting for inspection.
+		if (internalName == null || visitedKnownClasses.contains(internalName) || !queuedKnownClasses.add(internalName))
 			return;
 
 		// Add to the queue if the type is known.
@@ -158,6 +164,23 @@ public class PhantomConstraintCollector {
 		}
 	}
 
+	/**
+	 * Collects constraints from a type used in a {@code throws} clause.
+	 *
+	 * @param internalName
+	 * 		Type used in a {@code throws} clause.
+	 */
+	private void collectExceptionType(@Nullable String internalName) {
+		if (internalName == null)
+			return;
+		context.collectInternalName(internalName);
+		PhantomClassConstraint exceptionConstraint = constraint(internalName);
+		if (exceptionConstraint != null) {
+			exceptionConstraint.markClass();
+			exceptionConstraint.addRequiredSupertype("java/lang/Throwable");
+		}
+	}
+
 	@Nullable
 	private PhantomClassConstraint collectAnnotationDescriptor(@Nonnull String descriptor, boolean visible) {
 		context.collectDescriptor(descriptor);
@@ -187,6 +210,8 @@ public class PhantomConstraintCollector {
 	}
 
 	private void collectHandle(@Nonnull Handle handle) {
+		// Known owners can carry the only copy of a required hierarchy or annotation declaration.
+		queueKnownType(handle.getOwner());
 		PhantomClassConstraint ownerConstraint = constraint(handle.getOwner());
 		switch (handle.getTag()) {
 			case Opcodes.H_GETFIELD, Opcodes.H_PUTFIELD -> {
@@ -272,6 +297,9 @@ public class PhantomConstraintCollector {
 			@Override
 			public void visitEnum(String name, String descriptor, String value) {
 				context.collectDescriptor(descriptor);
+				PhantomClassConstraint enumConstraint = constraint(Type.getType(descriptor).getInternalName());
+				if (enumConstraint != null)
+					enumConstraint.addEnumConstant(value);
 				if (annotationConstraint != null && name != null)
 					annotationConstraint.addAnnotationElement(name, descriptor);
 				super.visitEnum(name, descriptor, value);
@@ -302,6 +330,9 @@ public class PhantomConstraintCollector {
 					@Override
 					public void visitEnum(String ignoredName, String descriptor, String value) {
 						context.collectDescriptor(descriptor);
+						PhantomClassConstraint enumConstraint = constraint(Type.getType(descriptor).getInternalName());
+						if (enumConstraint != null)
+							enumConstraint.addEnumConstant(value);
 						if (componentDescriptor == null)
 							componentDescriptor = descriptor;
 						super.visitEnum(ignoredName, descriptor, value);
@@ -329,16 +360,21 @@ public class PhantomConstraintCollector {
 
 	private class CollectionVisitor extends ClassVisitor {
 		private final boolean followReferences;
+		private final boolean collectCodeReferences;
+		private String currentClassName;
 
-		protected CollectionVisitor(boolean followReferences) {
+		protected CollectionVisitor(boolean followReferences, boolean collectCodeReferences) {
 			super(RecafConstants.getAsmVersion());
 			this.followReferences = followReferences;
+			this.collectCodeReferences = collectCodeReferences;
 		}
 
 		@Override
 		public void visit(int version, int access, String name, String signature, String superName, String[] interfaces) {
+			currentClassName = name;
 			collectSignature(signature);
 			queueKnownType(superName);
+
 			// Mark the supertype as a phantom candidate.
 			PhantomClassConstraint superConstraint = constraint(superName);
 			if (superConstraint != null)
@@ -363,6 +399,68 @@ public class PhantomConstraintCollector {
 		}
 
 		@Override
+		public void visitInnerClass(String name, String outerName, String innerName, int access) {
+			queueKnownType(name);
+			queueKnownType(outerName);
+
+			// Record inner/outer relationships for both the inner and outer class constraints.
+			PhantomClassConstraint innerConstraint = constraint(name);
+			PhantomClassConstraint outerConstraint = constraint(outerName);
+			if (innerConstraint != null && outerName != null && innerName != null)
+				innerConstraint.markInnerClassOf(outerName, innerName, access);
+			if (outerConstraint != null && name != null && innerName != null)
+				outerConstraint.addDeclaredInner(name, innerName, access);
+
+			super.visitInnerClass(name, outerName, innerName, access);
+		}
+
+		@Override
+		public void visitOuterClass(String owner, String name, String descriptor) {
+			queueKnownType(owner);
+
+			if (descriptor != null)
+				context.collectMethodDescriptor(descriptor);
+
+			if (owner != null && currentClassName != null) {
+				int separator = currentClassName.lastIndexOf('$');
+				if (separator > 0) {
+					String innerName = currentClassName.substring(separator + 1);
+
+					// Record inner/outer relationships for both the inner and outer class constraints.
+					PhantomClassConstraint innerConstraint = constraint(currentClassName);
+					PhantomClassConstraint outerConstraint = constraint(owner);
+					if (innerConstraint != null)
+						innerConstraint.markInnerClassOf(owner, innerName);
+					if (outerConstraint != null)
+						outerConstraint.addDeclaredInner(currentClassName, innerName);
+				}
+			}
+
+			super.visitOuterClass(owner, name, descriptor);
+		}
+
+		@Override
+		public void visitNestHost(String nestHost) {
+			queueKnownType(nestHost);
+			context.collectInternalName(nestHost);
+			super.visitNestHost(nestHost);
+		}
+
+		@Override
+		public void visitNestMember(String nestMember) {
+			queueKnownType(nestMember);
+			context.collectInternalName(nestMember);
+			super.visitNestMember(nestMember);
+		}
+
+		@Override
+		public void visitPermittedSubclass(String permittedSubclass) {
+			queueKnownType(permittedSubclass);
+			context.collectInternalName(permittedSubclass);
+			super.visitPermittedSubclass(permittedSubclass);
+		}
+
+		@Override
 		public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
 			return annotationCollector(super.visitAnnotation(descriptor, visible),
 					collectAnnotationDescriptor(descriptor, visible));
@@ -372,6 +470,28 @@ public class PhantomConstraintCollector {
 		public AnnotationVisitor visitTypeAnnotation(int typeRef, TypePath typePath, String descriptor, boolean visible) {
 			return annotationCollector(super.visitTypeAnnotation(typeRef, typePath, descriptor, visible),
 					collectAnnotationDescriptor(descriptor, visible));
+		}
+
+		@Override
+		public RecordComponentVisitor visitRecordComponent(String name, String descriptor, String signature) {
+			collectSignature(signature);
+			if (followReferences)
+				queueKnownTypes(Type.getType(descriptor));
+			context.collectDescriptor(descriptor);
+			return new RecordComponentVisitor(RecafConstants.getAsmVersion(), super.visitRecordComponent(name, descriptor, signature)) {
+				@Override
+				public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+					return annotationCollector(super.visitAnnotation(descriptor, visible),
+							collectAnnotationDescriptor(descriptor, visible));
+				}
+
+				@Override
+				public AnnotationVisitor visitTypeAnnotation(int typeRef, TypePath typePath,
+				                                             String descriptor, boolean visible) {
+					return annotationCollector(super.visitTypeAnnotation(typeRef, typePath, descriptor, visible),
+							collectAnnotationDescriptor(descriptor, visible));
+				}
+			};
 		}
 
 		@Override
@@ -404,7 +524,7 @@ public class PhantomConstraintCollector {
 			context.collectMethodDescriptor(descriptor);
 			if (exceptions != null)
 				for (String exception : exceptions)
-					context.collectInternalName(exception);
+					collectExceptionType(exception);
 
 			return new MethodVisitor(RecafConstants.getAsmVersion(), super.visitMethod(access, name, descriptor, signature, exceptions)) {
 				@Override
@@ -443,7 +563,30 @@ public class PhantomConstraintCollector {
 				}
 
 				@Override
+				public void visitLocalVariable(String name, String descriptor, String signature,
+				                               Label start, Label end, int index) {
+					collectSignature(signature);
+					if (followReferences)
+						queueKnownTypes(Type.getType(descriptor));
+					context.collectDescriptor(descriptor);
+					super.visitLocalVariable(name, descriptor, signature, start, end, index);
+				}
+
+				@Override
+				public AnnotationVisitor visitLocalVariableAnnotation(int typeRef, TypePath typePath,
+				                                                      Label[] start, Label[] end, int[] index,
+				                                                      String descriptor, boolean visible) {
+					return annotationCollector(super.visitLocalVariableAnnotation(typeRef, typePath, start, end,
+							index, descriptor, visible), collectAnnotationDescriptor(descriptor, visible));
+				}
+
+				@Override
 				public void visitTypeInsn(int opcode, String type) {
+					if (!collectCodeReferences) {
+						super.visitTypeInsn(opcode, type);
+						return;
+					}
+					queueKnownType(type);
 					if (opcode == Opcodes.NEW) {
 						PhantomClassConstraint ownerConstraint = constraint(type);
 						if (ownerConstraint != null)
@@ -459,6 +602,11 @@ public class PhantomConstraintCollector {
 
 				@Override
 				public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
+					if (!collectCodeReferences) {
+						super.visitFieldInsn(opcode, owner, name, descriptor);
+						return;
+					}
+					queueKnownType(owner);
 					PhantomClassConstraint ownerConstraint = constraint(owner);
 					if (ownerConstraint != null) {
 						if (opcode == Opcodes.GETFIELD || opcode == Opcodes.PUTFIELD)
@@ -472,6 +620,11 @@ public class PhantomConstraintCollector {
 
 				@Override
 				public void visitMethodInsn(int opcode, String owner, String name, String descriptor, boolean isInterface) {
+					if (!collectCodeReferences) {
+						super.visitMethodInsn(opcode, owner, name, descriptor, isInterface);
+						return;
+					}
+					queueKnownType(owner);
 					PhantomClassConstraint ownerConstraint = constraint(owner);
 					if (ownerConstraint != null) {
 						if (isInterface)
@@ -489,6 +642,10 @@ public class PhantomConstraintCollector {
 				@Override
 				public void visitInvokeDynamicInsn(String name, String descriptor, Handle bootstrapMethodHandle,
 				                                   Object... bootstrapMethodArguments) {
+					if (!collectCodeReferences) {
+						super.visitInvokeDynamicInsn(name, descriptor, bootstrapMethodHandle, bootstrapMethodArguments);
+						return;
+					}
 					context.collectMethodDescriptor(descriptor);
 					collectHandle(bootstrapMethodHandle);
 					for (Object bootstrapMethodArgument : bootstrapMethodArguments)
@@ -498,19 +655,27 @@ public class PhantomConstraintCollector {
 
 				@Override
 				public void visitLdcInsn(Object value) {
+					if (!collectCodeReferences) {
+						super.visitLdcInsn(value);
+						return;
+					}
 					collectConstant(value);
 					super.visitLdcInsn(value);
 				}
 
 				@Override
 				public void visitMultiANewArrayInsn(String descriptor, int numDimensions) {
+					if (!collectCodeReferences) {
+						super.visitMultiANewArrayInsn(descriptor, numDimensions);
+						return;
+					}
 					context.collectDescriptor(descriptor);
 					super.visitMultiANewArrayInsn(descriptor, numDimensions);
 				}
 
 				@Override
 				public void visitTryCatchBlock(Label start, Label end, Label handler, String type) {
-					context.collectInternalName(type);
+					collectExceptionType(type);
 					super.visitTryCatchBlock(start, end, handler, type);
 				}
 			};
@@ -527,14 +692,17 @@ public class PhantomConstraintCollector {
 
 		@Override
 		public void visitClassType(String name) {
+			context.collectInternalName(name);
 			className = name;
 			argumentCount = 0;
 		}
 
 		@Override
 		public void visitInnerClassType(String name) {
-			if (className != null)
+			if (className != null) {
 				className += '$' + name;
+				context.collectInternalName(className);
+			}
 			argumentCount = 0;
 		}
 

@@ -815,6 +815,38 @@ public class StringUtil {
 	}
 
 	/**
+	 * @param text
+	 * 		Text to check.
+	 * @param prefixes
+	 * 		Array of prefixes to check for.
+	 *
+	 * @return {@code true} when the text starts with any of the given prefixes.
+	 */
+	public static boolean startsWithAny(@Nonnull String text, @Nonnull String... prefixes) {
+		for (String prefix : prefixes) {
+			if (text.startsWith(prefix))
+				return true;
+		}
+		return false;
+	}
+
+	/**
+	 * @param text
+	 * 		Text to check.
+	 * @param prefixes
+	 * 		List of prefixes to check for.
+	 *
+	 * @return {@code true} when the text starts with any of the given prefixes.
+	 */
+	public static boolean startsWithAny(@Nonnull String text, @Nonnull List<String> prefixes) {
+		for (String prefix : prefixes) {
+			if (text.startsWith(prefix))
+				return true;
+		}
+		return false;
+	}
+
+	/**
 	 * @param args
 	 * 		Input arguments.
 	 *

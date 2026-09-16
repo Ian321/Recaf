@@ -29,6 +29,7 @@ public final class ArrayValueMutableImpl implements ArrayValue {
 	private final Nullness nullness;
 	private final OptionalInt length;
 	private final List<ReValue> contents;
+	private boolean containsSubArray;
 
 	private ArrayValueMutableImpl(@Nonnull ArrayValue source) {
 		type = source.type();
@@ -40,10 +41,16 @@ public final class ArrayValueMutableImpl implements ArrayValue {
 			contents = new ArrayList<>(length.getAsInt());
 			for (int i = 0; i < length.getAsInt(); i++) {
 				ReValue value = Objects.requireNonNull(source.getValue(i));
-				contents.add(value instanceof ArrayValue array ? wrap(array) : value);
+				if (value instanceof ArrayValue array) {
+					containsSubArray = true;
+					contents.add(wrap(array));
+				} else {
+					contents.add(value);
+				}
 			}
 		} else {
 			contents = null;
+			containsSubArray = false;
 		}
 	}
 
@@ -58,34 +65,60 @@ public final class ArrayValueMutableImpl implements ArrayValue {
 		return value instanceof ArrayValueMutableImpl ? value : new ArrayValueMutableImpl(value);
 	}
 
+	@Nonnull
 	@Override
 	public ArrayValue setValue(int index, @Nonnull ReValue value) {
-		if (hasKnownValue())
-			contents.set(index, value instanceof ArrayValue array ? wrap(array) : value);
+		// A known non-null array can retain per-slot knowledge even when another slot is unknown.
+		if (nullness == Nullness.NOT_NULL
+				&& length.isPresent()
+				&& contents != null
+				&& index >= 0
+				&& index < contents.size()) {
+			if (value instanceof ArrayValue array) {
+				containsSubArray = true;
+				contents.set(index, wrap(array));
+			} else {
+				contents.set(index, value);
+			}
+		}
 		return this;
 	}
 
+	@Nonnull
 	@Override
 	public ArrayValue updatedCopyIfContained(@Nonnull ReValue originalValue, @Nonnull ReValue updatedValue) {
-		if (hasKnownValue()) {
-			for (int i = 0; i < contents.size(); i++) {
-				ReValue content = contents.get(i);
+		if (originalValue instanceof ArrayValue && !containsTrackedSubArray())
+			return this;
 
-				// Case 1: The value is a direct entry in this array.
-				if (content == originalValue)
-					return setValue(i, updatedValue);
+		// Slight variation of the 'hasKnownValue' check, but we don't check for all contents being known.
+		// 1. That is slow.
+		// 2. We don't need to check for all contents being known, we just need to know if the value is contained.
+		if (nullness == Nullness.UNKNOWN || nullness == Nullness.NULL || length.isEmpty() || contents == null)
+			return this;
 
-					// Case 2: This array is multidimensional and the value is in a nested sub array.
-				else if (content instanceof ArrayValue subArray) {
-					ArrayValue updatedSubArray = subArray.updatedCopyIfContained(originalValue, updatedValue);
-					if (subArray != updatedSubArray)
-						return setValue(i, updatedSubArray);
-				}
+		int size = contents.size();
+		for (int i = 0; i < size; i++) {
+			ReValue content = contents.get(i);
+
+			// Case 1: The value is a direct entry in this array.
+			if (content == originalValue)
+				return setValue(i, updatedValue);
+
+			// Case 2: This array is multidimensional and the value is in a nested sub array.
+			if (content instanceof ArrayValue subArray) {
+				ArrayValue updatedSubArray = subArray.updatedCopyIfContained(originalValue, updatedValue);
+				if (subArray != updatedSubArray)
+					return setValue(i, updatedSubArray);
 			}
 		}
 
 		// Not contained, no changes needed.
 		return this;
+	}
+
+	@Override
+	public boolean containsTrackedSubArray() {
+		return containsSubArray;
 	}
 
 	@Override
@@ -117,6 +150,7 @@ public final class ArrayValueMutableImpl implements ArrayValue {
 		return nullness;
 	}
 
+	@Nonnull
 	@Override
 	public OptionalInt getFirstDimensionLength() {
 		return length;

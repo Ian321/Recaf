@@ -6,11 +6,11 @@ import software.coley.recaf.info.InnerClassInfo;
 
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * Aggregated requirements collected for a single phantom type.
@@ -19,19 +19,23 @@ import java.util.Set;
  */
 public class PhantomClassConstraint {
 	private final String name;
-	private final Map<String, PhantomFieldRequirement> fields = new HashMap<>();
-	private final Map<String, PhantomMethodRequirement> methods = new HashMap<>();
-	private final Map<String, PhantomInnerRequirement> declaredInners = new HashMap<>();
-	private final Set<String> requiredSupertypes = new HashSet<>();
-	private final Set<String> droppedSupertypes = new HashSet<>();
-	private final Set<String> resolvedInterfaces = new HashSet<>();
+	private final Map<String, PhantomFieldRequirement> fields = new TreeMap<>();
+	private final Map<String, PhantomMethodRequirement> methods = new TreeMap<>();
+	private final Map<String, PhantomInnerRequirement> declaredInners = new TreeMap<>();
+	private final Set<String> requiredSupertypes = new TreeSet<>();
+	private final Set<String> droppedSupertypes = new TreeSet<>();
+	private final Set<String> resolvedInterfaces = new TreeSet<>();
 	private boolean interfaceEvidence;
 	private boolean classEvidence;
 	private boolean annotationEvidence;
+	private boolean enumEvidence;
 	private boolean runtimeVisibleAnnotationEvidence;
+	private final Set<String> enumConstants = new TreeSet<>();
 	private int genericParameterCount;
 	private String outerName;
 	private String innerSimpleName;
+	private int innerClassAccess;
+	private final Map<String, Integer> declaredInnerAccess = new TreeMap<>();
 	private String resolvedSuperName = "java/lang/Object";
 
 	/**
@@ -152,6 +156,23 @@ public class PhantomClassConstraint {
 	}
 
 	/**
+	 * @return Access flags observed for this type's inner-class entry.
+	 */
+	public int getInnerClassAccess() {
+		return innerClassAccess;
+	}
+
+	/**
+	 * @param innerName
+	 * 		Inner class internal name.
+	 *
+	 * @return Access flags observed for the declared inner class, or {@code 0} when unavailable.
+	 */
+	public int getDeclaredInnerAccess(@Nonnull String innerName) {
+		return declaredInnerAccess.getOrDefault(innerName, 0);
+	}
+
+	/**
 	 * Marks the type as an interface.
 	 */
 	public void markInterface() {
@@ -178,6 +199,24 @@ public class PhantomClassConstraint {
 	}
 
 	/**
+	 * Marks the type as an enum.
+	 */
+	public void markEnum() {
+		enumEvidence = true;
+		classEvidence = true;
+		requiredSupertypes.add("java/lang/Enum");
+	}
+
+	/**
+	 * @param name
+	 * 		Observed enum constant name.
+	 */
+	public void addEnumConstant(@Nonnull String name) {
+		markEnum();
+		enumConstants.add(name);
+	}
+
+	/**
 	 * @return {@code true} when the constraint should be emitted as an annotation.
 	 */
 	public boolean isAnnotation() {
@@ -185,10 +224,25 @@ public class PhantomClassConstraint {
 	}
 
 	/**
+	 * @return {@code true} when the constraint should be emitted as an enum.
+	 */
+	public boolean isEnum() {
+		return enumEvidence && !annotationEvidence;
+	}
+
+	/**
+	 * @return Observed enum constant names.
+	 */
+	@Nonnull
+	public Set<String> getEnumConstants() {
+		return Collections.unmodifiableSet(enumConstants);
+	}
+
+	/**
 	 * @return {@code true} when the constraint should be emitted as an interface.
 	 */
 	public boolean isInterface() {
-		return isAnnotation() || (interfaceEvidence && !classEvidence);
+		return isAnnotation() || (!isEnum() && interfaceEvidence && !classEvidence);
 	}
 
 	/**
@@ -283,8 +337,22 @@ public class PhantomClassConstraint {
 	 * @see InnerClassInfo#getInnerClassName()
 	 */
 	public void markInnerClassOf(@Nonnull String outerName, @Nonnull String innerSimpleName) {
+		markInnerClassOf(outerName, innerSimpleName, 0);
+	}
+
+	/**
+	 * @param outerName
+	 * 		Full outer class name.
+	 * @param innerSimpleName
+	 * 		Simple inner class name.
+	 * @param access
+	 * 		Access flags from the inner-class entry.
+	 */
+	public void markInnerClassOf(@Nonnull String outerName, @Nonnull String innerSimpleName, int access) {
 		this.outerName = outerName;
 		this.innerSimpleName = innerSimpleName;
+		if (access != 0 || innerClassAccess == 0)
+			this.innerClassAccess = access;
 	}
 
 	/**
@@ -297,7 +365,21 @@ public class PhantomClassConstraint {
 	 * @see InnerClassInfo#getInnerClassName()
 	 */
 	public void addDeclaredInner(@Nonnull String innerName, @Nonnull String innerSimpleName) {
+		addDeclaredInner(innerName, innerSimpleName, 0);
+	}
+
+	/**
+	 * @param innerName
+	 * 		Full inner class name.
+	 * @param innerSimpleName
+	 * 		Simple inner class name.
+	 * @param access
+	 * 		Access flags from the inner-class entry.
+	 */
+	public void addDeclaredInner(@Nonnull String innerName, @Nonnull String innerSimpleName, int access) {
 		declaredInners.put(innerName, new PhantomInnerRequirement(innerName, innerSimpleName));
+		if (access != 0 || !declaredInnerAccess.containsKey(innerName))
+			declaredInnerAccess.put(innerName, access);
 	}
 
 	/**

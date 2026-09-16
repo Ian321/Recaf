@@ -275,6 +275,34 @@ public class TryCatchDeobfuscationTest extends TransformerTestBase {
 	}
 
 	@Test
+	void removeStringConstantCheckcastCastException() {
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       {  A,  B,  C, Ljava/lang/ClassCastException; }
+				    },
+				    code: {
+				    A:
+				        ldc "foo"
+				        checkcast java/lang/String
+				        pop
+				    B:
+				        goto END
+				    C:
+				        pop
+				    END:
+				        return
+				    }
+				}
+				""";
+		validateAfterAssembly(asm, List.of(RedundantTryCatchRemovingTransformer.class), dis -> {
+			assertEquals(0, StringUtil.count("exceptions:", dis), "Expected to remove the impossible cast exception");
+			assertEquals(1, StringUtil.count("checkcast", dis), "Expected the independent catch pass to keep the cast itself");
+			assertEquals(1, StringUtil.count("pop", dis), "Expected to remove the dead catch handler");
+		});
+	}
+
+	@Test
 	void removeSameTypeCheckcastCastException() {
 		String asm = """
 				.method public static example ()V {
@@ -334,6 +362,94 @@ public class TryCatchDeobfuscationTest extends TransformerTestBase {
 				}
 				""";
 		validateAfterAssembly(asm, List.of(RedundantTryCatchRemovingTransformer.class), dis -> {});
+	}
+
+	@Test
+	void retainSideEffectingRethrowHandler() {
+		// If we have a catch block with a rethrow but also some side-effecting code, then we cannot remove the catch block.
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       {  A,  B,  C, Ljava/lang/Exception; }
+				    },
+				    code: {
+				    A:
+				        invokestatic Foo.mayFail ()V
+				    B:
+				        goto END
+				    C:
+				        astore ex
+				        aload ex
+				        dup
+				        invokestatic Foo.observe (Ljava/lang/Throwable;)V
+				        athrow
+				    END:
+				        return
+				    }
+				}
+				""";
+		validateNoTransformation(asm, List.of(RedundantTryCatchRemovingTransformer.class));
+	}
+
+	@Test
+	void removeDirectRethrowHandler() {
+		// If we have code like this:
+		// try {
+		//     Foo.mayFail();
+		// } catch (Exception ex) {
+		//     throw ex;
+		// }
+		// Then the catch block is effectively a no-op and can be removed.
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       {  A,  B,  C, Ljava/lang/Exception; }
+				    },
+				    code: {
+				    A:
+				        invokestatic Foo.mayFail ()V
+				    B:
+				        goto END
+				    C:
+				        athrow
+				    END:
+				        return
+				    }
+				}
+				""";
+		validateAfterAssembly(asm, List.of(RedundantTryCatchRemovingTransformer.class), dis -> {
+			assertFalse(dis.contains("exceptions:"), "Direct rethrow handler should be removed");
+			assertFalse(dis.contains("athrow"), "Unreferenced direct rethrow should be removed");
+		});
+	}
+
+	@Test
+	void removeIdentityRethrowHandler() {
+		// Same idea as above.
+		String asm = """
+				.method public static example ()V {
+					exceptions: {
+				       {  A,  B,  C, Ljava/lang/Exception; }
+				    },
+				    code: {
+				    A:
+				        invokestatic Foo.mayFail ()V
+				    B:
+				        goto END
+				    C:
+				        astore ex
+				        aload ex
+				        athrow
+				    END:
+				        return
+				    }
+				}
+				""";
+		validateAfterAssembly(asm, List.of(RedundantTryCatchRemovingTransformer.class), dis -> {
+			assertFalse(dis.contains("exceptions:"), "Identity rethrow handler should be removed");
+			assertFalse(dis.contains("athrow"), "Unreferenced identity rethrow should be removed");
+			assertFalse(dis.contains("astore ex"), "Unreferenced identity rethrow should be removed");
+		});
 	}
 
 	@Test

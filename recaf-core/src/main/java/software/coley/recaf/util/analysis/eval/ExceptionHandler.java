@@ -23,7 +23,9 @@ import software.coley.recaf.util.analysis.value.ThrowableValue;
 import software.coley.recaf.util.analysis.value.impl.ArrayValueImpl;
 import software.coley.recaf.util.analysis.value.impl.ThrowableValueImpl;
 
+import java.lang.reflect.Array;
 import java.util.List;
+import java.util.OptionalInt;
 import java.util.function.Supplier;
 
 /**
@@ -67,10 +69,6 @@ public class ExceptionHandler {
 		return interpreter.isAssignableFrom("java/lang/Throwable", internalName);
 	}
 
-	private boolean isAssignableFrom(@Nonnull String parent, @Nonnull String child) {
-		return interpreter.isAssignableFrom(parent, child);
-	}
-
 	/**
 	 * Checks whether an invocation initializes a throwable.
 	 *
@@ -94,6 +92,20 @@ public class ExceptionHandler {
 	public boolean isThrowableGetStackTrace(@Nonnull MethodInsnNode instruction) {
 		return instruction.name.equals("getStackTrace")
 				&& instruction.desc.equals("()[Ljava/lang/StackTraceElement;")
+				&& isThrowableType(instruction.owner);
+	}
+
+	/**
+	 * Checks whether an invocation only logs a throwable and has no value-producing side effect.
+	 *
+	 * @param instruction
+	 * 		Invocation instruction to inspect.
+	 *
+	 * @return {@code true} if the instruction invokes {@code printStackTrace()} on a throwable.
+	 */
+	public boolean isThrowablePrintStackTrace(@Nonnull MethodInsnNode instruction) {
+		return instruction.name.equals("printStackTrace")
+				&& instruction.desc.equals("()V")
 				&& isThrowableType(instruction.owner);
 	}
 
@@ -166,7 +178,7 @@ public class ExceptionHandler {
 				int end = method.instructions.indexOf(block.end);
 				if (sourceIndex < start || sourceIndex >= end)
 					continue;
-				if (block.type == null || isAssignableFrom(block.type, object.type().getInternalName())) {
+				if (block.type == null || interpreter.isAssignableFrom(block.type, object.type().getInternalName())) {
 					frame.clearStack();
 					frame.push(exception);
 					return block.handler;
@@ -231,15 +243,22 @@ public class ExceptionHandler {
 		if (isNull(arrayOrReceiver))
 			return newThrowable("java/lang/NullPointerException", null);
 
-		// Check for out-of-bounds array access.
-		if (!(arrayOrReceiver instanceof ArrayValue array))
+		// Only array loads have an index to validate.
+		if (opcode == Opcodes.GETFIELD || opcode == Opcodes.ARRAYLENGTH)
 			return null;
+
+		// Must know the array length to check for out-of-bounds access.
+		OptionalInt length = getArrayLength(arrayOrReceiver);
+		if (length.isEmpty())
+			return null;
+
+		// Must know the index to check for out-of-bounds access.
 		ReValue index = peek(frame);
 		if (!(index instanceof IntValue intIndex) || intIndex.value().isEmpty())
 			return null;
+
 		int value = intIndex.value().getAsInt();
-		if (array.getFirstDimensionLength().isPresent() &&
-				(value < 0 || value >= array.getFirstDimensionLength().getAsInt()))
+		if (value < 0 || value >= length.getAsInt())
 			return newThrowable("java/lang/ArrayIndexOutOfBoundsException", null);
 		return null;
 	}
@@ -250,23 +269,27 @@ public class ExceptionHandler {
 		ReValue arrayValue = peekFromTop(frame, 2);
 		if (isNull(arrayValue))
 			return newThrowable("java/lang/NullPointerException", null);
-		if (!(arrayValue instanceof ArrayValue array))
-			return null;
 
 		// Check for out-of-bounds array store.
+		OptionalInt length = getArrayLength(arrayValue);
 		ReValue index = peekFromTop(frame, 1);
 		if (index instanceof IntValue intIndex
 				&& intIndex.value().isPresent()
-				&& array.getFirstDimensionLength().isPresent()) {
+				&& length.isPresent()) {
 			int value = intIndex.value().getAsInt();
-			if (value < 0 || value >= array.getFirstDimensionLength().getAsInt())
+			if (value < 0 || value >= length.getAsInt())
 				return newThrowable("java/lang/ArrayIndexOutOfBoundsException", null);
 		}
-		if (instruction.getOpcode() == Opcodes.AASTORE && array.elementType().getSort() == Type.OBJECT) {
+
+		// Check reference-array stores when the component type is known.
+		if (instruction.getOpcode() == Opcodes.AASTORE) {
+			Type componentType = getArrayComponentType(arrayValue);
 			ReValue stored = peek(frame);
-			if (stored instanceof ObjectValue object
+			if (componentType != null
+					&& (componentType.getSort() == Type.OBJECT || componentType.getSort() == Type.ARRAY)
+					&& stored instanceof ObjectValue object
 					&& !object.isNull()
-					&& !isAssignableFrom(array.elementType().getInternalName(), stored.type().getInternalName()))
+					&& !interpreter.isAssignableFrom(componentType, stored.type()))
 				return newThrowable("java/lang/ArrayStoreException", null);
 		}
 		return null;
@@ -290,9 +313,10 @@ public class ExceptionHandler {
 		// If the value is null, then it can be cast to any type.
 		// Otherwise, the value must be assignable to the target type.
 		ReValue value = peek(frame);
+		Type targetType = typeInsn.desc.startsWith("[") ? Type.getType(typeInsn.desc) : Type.getObjectType(typeInsn.desc);
 		if (value instanceof ObjectValue object
 				&& !object.isNull()
-				&& !isAssignableFrom(typeInsn.desc, value.type().getInternalName()))
+				&& !interpreter.isAssignableFrom(targetType, value.type()))
 			return newThrowable("java/lang/ClassCastException", null);
 		return null;
 	}
@@ -328,6 +352,28 @@ public class ExceptionHandler {
 
 	private static boolean isNegative(@Nullable ReValue value) {
 		return value instanceof IntValue intValue && intValue.isLessThan(0);
+	}
+
+	@Nonnull
+	private static OptionalInt getArrayLength(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return array.getFirstDimensionLength();
+		if (!(value instanceof InstancedObjectValue<?> instanced) || instanced.type().getSort() != Type.ARRAY)
+			return OptionalInt.empty();
+		Object realInstance = instanced.getRealInstance();
+		return realInstance != null && realInstance.getClass().isArray()
+				? OptionalInt.of(Array.getLength(realInstance)) : OptionalInt.empty();
+	}
+
+	@Nullable
+	private static Type getArrayComponentType(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return array.elementType();
+		if (!(value instanceof InstancedObjectValue<?> instanced) || instanced.type().getSort() != Type.ARRAY)
+			return null;
+		Object realInstance = instanced.getRealInstance();
+		return realInstance != null && realInstance.getClass().isArray()
+				? Type.getType(realInstance.getClass()).getElementType() : null;
 	}
 
 	/**

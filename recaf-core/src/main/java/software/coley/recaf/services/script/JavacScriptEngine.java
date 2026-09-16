@@ -15,6 +15,7 @@ import software.coley.recaf.services.compile.JavacArgumentsBuilder;
 import software.coley.recaf.services.compile.JavacCompiler;
 import software.coley.recaf.services.plugin.CdiClassAllocator;
 import software.coley.recaf.util.CancelSignal;
+import software.coley.recaf.util.ClassDefiner;
 import software.coley.recaf.util.ReflectUtil;
 import software.coley.recaf.util.threading.ThreadPoolFactory;
 
@@ -198,8 +199,11 @@ public class JavacScriptEngine implements ScriptEngine {
 		CompilerResult result = compiler.compile(args, null, null);
 		List<CompilerDiagnostic> diagnostics = mapDiagnostics(src.source(), result.getDiagnostics());
 		if (result.wasSuccess()) {
-			Map<String, byte[]> classes = result.getCompilations().entrySet().stream()
-					.collect(Collectors.toMap(e -> e.getKey().replace('/', '.'), e -> postProcessClass(e.getValue())));
+			Map<String, byte[]> rawClasses = result.getCompilations().entrySet().stream()
+					.collect(Collectors.toMap(e -> e.getKey().replace('/', '.'), Map.Entry::getValue));
+			ClassDefiner resolver = new ClassDefiner(rawClasses);
+			Map<String, byte[]> classes = rawClasses.entrySet().stream()
+					.collect(Collectors.toMap(Map.Entry::getKey, e -> postProcessClass(resolver, e.getValue())));
 			injectClasses(classes);
 			return new ScriptTemplate.Generated(className.replace('/', '.'), Map.copyOf(classes), diagnostics);
 		}
@@ -207,9 +211,15 @@ public class JavacScriptEngine implements ScriptEngine {
 	}
 
 	@Nonnull
-	private byte[] postProcessClass(@Nonnull byte[] classBytes) {
+	private byte[] postProcessClass(@Nonnull ClassLoader resolver, @Nonnull byte[] classBytes) {
 		ClassReader cr = new ClassReader(classBytes);
-		ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
+		ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+			@Override
+			protected ClassLoader getClassLoader() {
+				// Resolve generated types from the compilation rather than the application loader.
+				return resolver;
+			}
+		};
 		cr.accept(new InsertCancelSignalVisitor(cw), ClassReader.EXPAND_FRAMES);
 		return cw.toByteArray();
 	}

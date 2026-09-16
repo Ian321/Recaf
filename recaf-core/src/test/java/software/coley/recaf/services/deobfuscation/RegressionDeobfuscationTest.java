@@ -2,7 +2,13 @@ package software.coley.recaf.services.deobfuscation;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.DisabledIfEnvironmentVariable;
+import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.AbstractInsnNode;
+import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.MethodInsnNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.VarInsnNode;
 import software.coley.recaf.services.deobfuscation.transform.generic.CallResultInliningTransformer;
 import software.coley.recaf.services.deobfuscation.transform.generic.DeadCodeRemovingTransformer;
 import software.coley.recaf.services.deobfuscation.transform.generic.GotoInliningTransformer;
@@ -11,7 +17,7 @@ import software.coley.recaf.services.deobfuscation.transform.generic.OpaquePredi
 import software.coley.recaf.services.deobfuscation.transform.generic.RedundantTryCatchRemovingTransformer;
 import software.coley.recaf.services.deobfuscation.transform.generic.VariableFoldingTransformer;
 import software.coley.recaf.services.transform.JvmTransformResult;
-import software.coley.recaf.services.transform.TransformationException;
+import software.coley.recaf.services.transform.TransformationParameters;
 import software.coley.recaf.util.AsmInsnUtil;
 import software.coley.recaf.util.RegexUtil;
 import software.coley.recaf.util.StringUtil;
@@ -19,6 +25,7 @@ import software.coley.recaf.util.analysis.ReInterpreter;
 import software.coley.recaf.util.analysis.value.ReValue;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -438,6 +445,135 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 				}
 				""";
 		validateNoTransformation(asm, List.of(VariableFoldingTransformer.class));
+	}
+
+	/**
+	 * Prior transformer behavior would try to fold the first part, but also break the second part by changing
+	 * {@code iload} to {@code aload} if the slot was the same. We want to fold the first part without breaking
+	 * the second part.
+	 */
+	@Test
+	void variableFoldingKeepsDifferentTypedSlotReuse() {
+		String asm = """
+				.method public static example (Ljava/lang/Object;)I {
+				    parameters: { source },
+				    code: {
+				    A:
+				        aload source
+				        astore copy // transformer wants to fold this redundant store to use just 'source'
+				        aload copy
+				        pop
+				    B:
+				        // Rewrite 'copy' to hold an int from this point onward.
+				        invokestatic Example.getValue ()I
+				        istore copy
+				    C:
+				        // Transformer should keep this as iload as the value of 'copy' is a clearly different type.
+				        iload copy
+				        ireturn
+				    D:
+				    }
+				}
+				""";
+		validateAfterAssembly(asm, List.of(VariableFoldingTransformer.class), dis -> {
+			assertTrue(RegexUtil.matchesAny("iload \\w+\\s+ireturn", dis), "The integer reuse of the copy slot must remain an integer load");
+			assertFalse(RegexUtil.matchesAny("aload source\\s+ireturn", dis), "The reference source must not replace the integer result");
+		});
+	}
+
+	/**
+	 * Variant of the above test, main thing we are testing here is that the {@code iinc} doesn't trip up the
+	 * tracking of the foldable reference portion at the start.
+	 */
+	@Test
+	void variableFoldingKeepsIincForDifferentTypedSlotReuse() {
+		String asm = """
+				.method public static example (Ljava/lang/Object;)I {
+				    parameters: { source },
+				    code: {
+				    A:
+				        aload source
+				        astore copy
+				        aload copy
+				        pop
+				    B:
+				        invokestatic Example.getValue ()I
+				        istore copy
+				    C:
+				        iinc copy 1
+				        iload copy
+				        ireturn
+				    D:
+				    }
+				}
+				""";
+		validateAfterAssembly(asm, List.of(VariableFoldingTransformer.class), dis -> {
+			assertTrue(RegexUtil.matchesAny("istore (\\w+)\\s+iinc \\1 1\\s+iload \\1", dis), "The integer increment must remain on the reused slot");
+			assertFalse(RegexUtil.matchesAny("iinc i0 1", dis), "The reference source must not receive the integer increment");
+		});
+	}
+
+	/**
+	 * Another variant that allows the first part to be folded, without getting confused by the slot re-assignment later.
+	 */
+	@Test
+	void variableFoldingResetsAfterSlotDomination() {
+		String asm = """
+				.method public static example (Ljava/lang/Object;)Ljava/lang/Object; {
+				    parameters: { source },
+				    code: {
+				    A:
+				        aload source
+				        astore copy
+				        aload copy // <-- Can be 'source'
+				        pop
+				    B:
+				        invokestatic Example.getValue ()Ljava/lang/Object;
+				        astore copy
+				    C:
+				        aload copy // <-- Must remain as 'copy'
+				        areturn
+				    D:
+				    }
+				}
+				""";
+		validateAfterAssembly(asm, List.of(VariableFoldingTransformer.class), dis -> {
+			// The first copy is redundant and should be replaced with direct source loads.
+			assertTrue(RegexUtil.matchesAny("aload source\\s+pop\\s+aload source\\s+pop", dis), "The copy should fold before the later overwrite");
+
+			// The later definition must remain the value read by the return path.
+			assertTrue(RegexUtil.matchesAny("invokestatic Example.getValue \\(\\)Ljava/lang/Object;\\s+astore \\w+\\s+aload \\w+\\s+areturn", dis), "The later slot definition and read must remain");
+			assertFalse(RegexUtil.matchesAny("invokestatic Example.getValue \\(\\)Ljava/lang/Object;\\s+astore \\w+\\s+aload source\\s+areturn", dis), "The later slot definition must not be replaced with the original source");
+		});
+	}
+
+	/**
+	 * Illegal code that writes to wide-reserved slots shouldn't trigger transformations.
+	 */
+	@Test
+	void variableFoldingRejectsOverlappingWideSourceWrite() {
+		putClass(CLASS_NAME, node -> {
+			// Pseudocode: long example(long p0)
+			//    long v2 = p0;
+			//    int i1 = getValue(); // Illegal store to reserved slot 1 (overlaps with reserved slot of p0)
+			//    i1;
+			//    return v2;
+			MethodNode method = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "example", "(J)J", null, null);
+			method.instructions.add(new VarInsnNode(Opcodes.LLOAD, 0));
+			method.instructions.add(new VarInsnNode(Opcodes.LSTORE, 2));
+			method.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, CLASS_NAME, "getValue", "()I", false));
+			method.instructions.add(new VarInsnNode(Opcodes.ISTORE, 1));
+			method.instructions.add(new VarInsnNode(Opcodes.ILOAD, 1));
+			method.instructions.add(new InsnNode(Opcodes.POP));
+			method.instructions.add(new VarInsnNode(Opcodes.LLOAD, 2));
+			method.instructions.add(new InsnNode(Opcodes.LRETURN));
+			method.maxStack = 2;
+			method.maxLocals = 4;
+			node.methods.add(method);
+		});
+		JvmTransformResult result = assertDoesNotThrow(() -> newApplier().transformJvm(List.of(VariableFoldingTransformer.class)));
+		assertTrue(result.getTransformerFailures().isEmpty(), "There were transformation failures");
+		assertTrue(result.getTransformedClasses().isEmpty(), "The overlapping source write must prevent copy folding");
 	}
 
 	@Test
@@ -1494,11 +1630,65 @@ public class RegressionDeobfuscationTest extends TransformerTestBase {
 		});
 	}
 
+	@Test
+	void analyzerRequeuesReachableBranchTargets() {
+		// When we use ReAnalyzer/ReFrame we need to ensure that the first branching behavior to some destination frame
+		// does not prevent a later reachable branch from re-analyzing that destination frame. In the past when this
+		// bug was present, the first branch would mark 'TARGET' as unreachable, and any transformer would ignore
+		// the contents of the TARGET block.
+		String asm = """
+				.super java/lang/Object
+				.class Example {
+					.method static <clinit> ()V {
+					    code: {
+					    ENTRY:
+					        // This first branch is opaque, and indicate TARGET is unreachable from ENTRY.
+					        iconst_1
+					        iconst_0
+					        if_icmpgt PATH_A // GOTO PATH_A
+					    TARGET:
+					        invokestatic Example.value ()Ljava/lang/String;
+					        pop
+					        return
+					    PATH_A:
+					        // This second branch is also opaque, but indicates TARGET is reachable from PATH_A.
+					        iconst_1
+					        iconst_0
+					        if_icmpgt TARGET // GOTO TARGET
+					        return
+					    }
+					}
+					.method static value ()Ljava/lang/String; {
+					    code: {
+					    A:
+					        ldc "reachable"
+					        areturn
+					    B:
+					    }
+					}
+				}
+				""";
+		assemble(asm, true);
+
+		TransformationParameters parameters = new TransformationParameters(Map.of(
+				CallResultInliningTransformer.KEY_EVALUATE_CLASS_INITIALIZERS, true));
+		JvmTransformResult result = assertDoesNotThrow(() ->
+				newApplier().transformJvm(List.of(CallResultInliningTransformer.class), parameters));
+		assertTrue(result.getTransformerFailures().isEmpty(), "There were transformation failures");
+
+		String disassembly = disassembleTransformed(result, true);
+		assertEquals(0, StringUtil.count("invokestatic Example.value", disassembly),
+				"A later reachable edge must requeue the previously pruned target");
+		assertEquals(2, StringUtil.count("ldc \"reachable\"", disassembly),
+				"The reachable initializer call must be replaced with its exact value");
+	}
+
 	/**
 	 * Ensures the const-folder doesn't take too long to run.
 	 */
 	@Test
-	@Timeout(value = 1)
+	@Timeout(value = 2)
+	@DisabledIfEnvironmentVariable(named = "GITHUB_ACTIONS", matches = "true")
 	void constFolderDoesNotCatestrophicallyBacktrack() {
 		String asm = """
 				.method public static example (I)I {

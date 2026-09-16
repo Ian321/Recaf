@@ -33,6 +33,8 @@ import static software.coley.recaf.util.AsmInsnUtil.isConstIntValue;
  */
 @Dependent
 public class EnumNameRestorationTransformer implements JvmClassTransformer {
+	public static final String IDENTIFIER = "restoration.enumname";
+
 	private static final String VALUES_ARRAY_NAME = "$values";
 
 	@Override
@@ -132,7 +134,7 @@ public class EnumNameRestorationTransformer implements JvmClassTransformer {
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Enum name restoration";
+	public String identifier() {
+		return IDENTIFIER;
 	}
 }

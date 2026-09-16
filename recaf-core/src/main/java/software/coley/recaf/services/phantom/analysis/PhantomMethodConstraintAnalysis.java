@@ -83,10 +83,9 @@ public class PhantomMethodConstraintAnalysis {
 
 		// Queue up propagation/simulation of state across the CFG until we reach a fixed point.
 		// We'll cap the number of iterations to avoid infinite loops in any weird/contrived cases.
-		int maxIterations = insns.length * 10;
 		Deque<Integer> unprocessed = new ArrayDeque<>();
 		unprocessed.add(0);
-		while (!unprocessed.isEmpty() && (maxIterations-- > 0)) {
+		while (!unprocessed.isEmpty()) {
 			int index = unprocessed.removeFirst();
 
 			// Skip if we don't have any state for this instruction.
@@ -161,6 +160,15 @@ public class PhantomMethodConstraintAnalysis {
 			}
 			case Opcodes.ARETURN -> addSubtypeConstraints(peek(stack, 0), Type.getReturnType(method.desc));
 			case Opcodes.ATHROW -> addSubtypeConstraints(peek(stack, 0), Type.getObjectType("java/lang/Throwable"));
+			case Opcodes.INVOKEDYNAMIC -> {
+				InvokeDynamicInsnNode dynamicInsn = (InvokeDynamicInsnNode) insn;
+				Type[] argumentTypes = Type.getArgumentTypes(dynamicInsn.desc);
+				int stackOffset = 0;
+				for (int arg = argumentTypes.length - 1; arg >= 0; arg--) {
+					addSubtypeConstraints(peek(stack, stackOffset), argumentTypes[arg]);
+					stackOffset++;
+				}
+			}
 			case Opcodes.INVOKEINTERFACE, Opcodes.INVOKEVIRTUAL, Opcodes.INVOKESPECIAL, Opcodes.INVOKESTATIC -> {
 				MethodInsnNode methodInsn = (MethodInsnNode) insn;
 				Type[] argumentTypes = Type.getArgumentTypes(methodInsn.desc);
@@ -171,10 +179,7 @@ public class PhantomMethodConstraintAnalysis {
 				}
 				if (insn.getOpcode() != Opcodes.INVOKESTATIC) {
 					SubtypeValue receiver = peek(stack, stackOffset);
-					if (insn.getOpcode() == Opcodes.INVOKEINTERFACE || insn.getOpcode() == Opcodes.INVOKEVIRTUAL ||
-							(insn.getOpcode() == Opcodes.INVOKESPECIAL && "<init>".equals(methodInsn.name))) {
-						addSubtypeConstraints(receiver, Type.getObjectType(methodInsn.owner));
-					}
+					addSubtypeConstraints(receiver, Type.getObjectType(methodInsn.owner));
 				}
 			}
 			default -> {
@@ -192,10 +197,13 @@ public class PhantomMethodConstraintAnalysis {
 	 * 		Target type the value is being used as.
 	 */
 	private void addSubtypeConstraints(@Nullable SubtypeValue source, @Nullable Type targetType) {
-		// Skip if there's no reference evidence or the target isn't a reference type.
-		if (source == null || !isReferenceType(targetType))
+		// Skip if the target isn't a reference type.
+		if (!isReferenceType(targetType))
 			return;
-		if (targetType.getSort() != Type.OBJECT)
+
+		// A target may exist only in debug metadata, so collect it before recording subtype evidence.
+		context.collectType(targetType);
+		if (source == null || targetType.getSort() != Type.OBJECT)
 			return;
 
 		// Add a "source must extend/implement target" requirement for each phantom reference tracked by the value.

@@ -16,6 +16,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Resolves the phantom constraints into a type hierarchy.
@@ -109,14 +110,14 @@ public class PhantomHierarchyResolver {
 	private void resolveSubtypeConstraints() throws PhantomGenerationException {
 		for (PhantomClassConstraint constraint : constraints.values()) {
 			// Compute super/interface parents of the phantom class.
-			Set<String> classCandidates = new HashSet<>();
-			Set<String> interfaceCandidates = new HashSet<>();
+			Set<String> classCandidates = new TreeSet<>();
+			Set<String> interfaceCandidates = new TreeSet<>();
 			for (String candidate : constraint.getRequiredSupertypes()) {
 				if (constraint.getName().equals(candidate))
 					continue;
 				switch (context.kindOf(candidate)) {
 					case INTERFACE, ANNOTATION -> interfaceCandidates.add(candidate);
-					case CLASS, UNKNOWN -> classCandidates.add(candidate);
+					case CLASS, ENUM, UNKNOWN -> classCandidates.add(candidate);
 				}
 			}
 
@@ -195,7 +196,8 @@ public class PhantomHierarchyResolver {
 		PhantomClassConstraint constraint = constraints.get(internalName);
 		return constraint != null
 				&& !constraint.isInterface()
-				&& !constraint.isAnnotation();
+				&& !constraint.isAnnotation()
+				&& !constraint.isEnum();
 	}
 
 	/**

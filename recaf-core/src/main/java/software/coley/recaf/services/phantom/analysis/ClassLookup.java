@@ -6,12 +6,21 @@ import org.objectweb.asm.Type;
 import software.coley.recaf.info.ClassInfo;
 import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.path.ClassPathNode;
+import software.coley.recaf.path.PathNodes;
+import software.coley.recaf.services.phantom.GeneratedPhantomWorkspaceResource;
 import software.coley.recaf.services.phantom.model.PhantomClassConstraint;
 import software.coley.recaf.workspace.model.Workspace;
+import software.coley.recaf.workspace.model.bundle.JvmClassBundle;
+import software.coley.recaf.workspace.model.bundle.VersionedJvmClassBundle;
+import software.coley.recaf.workspace.model.resource.RuntimeWorkspaceResource;
+import software.coley.recaf.workspace.model.resource.WorkspaceResource;
 
+import java.util.ArrayDeque;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 
 /**
@@ -22,6 +31,9 @@ import java.util.Set;
 public class ClassLookup {
 	private final Workspace workspace;
 	private final Map<String, JvmClassInfo> providedClasses;
+	private final Map<String, ClassInfo> knownClasses = new HashMap<>();
+	private final Set<String> missingClasses = new HashSet<>();
+	private final int targetVersion;
 	private final Map<String, PhantomClassConstraint> constraints;
 
 	/**
@@ -31,23 +43,27 @@ public class ClassLookup {
 	 * 		Input classes currently being analyzed.
 	 * @param constraints
 	 * 		Shared phantom constraints for the current analysis run.
+	 * @param targetVersion
+	 * 		Java version whose multi-release classes should be selected.
 	 */
 	public ClassLookup(@Nonnull Workspace workspace,
 	                   @Nonnull Map<String, JvmClassInfo> providedClasses,
-	                   @Nonnull Map<String, PhantomClassConstraint> constraints) {
+	                   @Nonnull Map<String, PhantomClassConstraint> constraints,
+	                   int targetVersion) {
 		this.workspace = workspace;
 		this.providedClasses = new HashMap<>(providedClasses);
 		this.constraints = constraints;
+		this.targetVersion = targetVersion;
 	}
 
 	/**
 	 * @param internalName
 	 * 		Internal class name.
 	 *
-	 * @return {@code true} when the type is already known from the inputs or workspace.
+	 * @return {@code true} when the type is already known from the inputs, workspace, or runtime classes.
 	 */
 	public boolean isKnown(@Nullable String internalName) {
-		return getKnownClassInfo(internalName) != null;
+		return isBootstrapType(internalName) || getKnownClassInfo(internalName) != null;
 	}
 
 	/**
@@ -61,12 +77,27 @@ public class ClassLookup {
 		if (internalName == null)
 			return null;
 
-		// First check the provided input classes, then fall back to the workspace.
+		// Provided classes have priority over workspace classes, since they are the ones currently being analyzed.
 		JvmClassInfo provided = providedClasses.get(internalName);
 		if (provided != null)
 			return provided;
-		ClassPathNode path = workspace.findClass(internalName);
-		return path == null ? null : path.getValue();
+
+		// Check the cache of known classes, then check the cache of missing classes.
+		ClassInfo cached = knownClasses.get(internalName);
+		if (cached != null)
+			return cached;
+		if (missingClasses.contains(internalName))
+			return null;
+
+		// Lookup the class in the workspace, and cache the result (or lack thereof).
+		ClassPathNode path = findJvmClass(internalName);
+		if (path == null) {
+			missingClasses.add(internalName);
+			return null;
+		}
+		cached = path.getValue();
+		knownClasses.put(internalName, cached);
+		return cached;
 	}
 
 	/**
@@ -82,6 +113,8 @@ public class ClassLookup {
 		if (constraint != null) {
 			if (constraint.isAnnotation())
 				return PhantomTypeKind.ANNOTATION;
+			if (constraint.isEnum())
+				return PhantomTypeKind.ENUM;
 			if (constraint.isInterface())
 				return PhantomTypeKind.INTERFACE;
 			if (constraint.hasClassEvidence() || !constraint.getRequiredSupertypes().isEmpty())
@@ -91,7 +124,9 @@ public class ClassLookup {
 		// No phantom evidence, infer from known class info.
 		ClassInfo info = getKnownClassInfo(internalName);
 		if (info == null)
-			return PhantomTypeKind.UNKNOWN;
+			return isBootstrapType(internalName) ? bootstrapKind(internalName) : PhantomTypeKind.UNKNOWN;
+		if (info.hasEnumModifier())
+			return PhantomTypeKind.ENUM;
 		if (info.hasAnnotationModifier())
 			return PhantomTypeKind.ANNOTATION;
 		return info.hasInterfaceModifier() ? PhantomTypeKind.INTERFACE : PhantomTypeKind.CLASS;
@@ -214,5 +249,75 @@ public class ClassLookup {
 	 */
 	public void collectMethodDescriptor(@Nonnull String descriptor) {
 		collectType(Type.getMethodType(descriptor));
+	}
+
+	/**
+	 * Find the path to the most appropriate class in the workspace for the given internal name.
+	 * When multi-release classes are present, the highest version not newer than the compiler target is selected.
+	 *
+	 * @param internalName
+	 * 		Class name.
+	 *
+	 * @return Path to the class in the workspace, or {@code null} when it is not found.
+	 */
+	@Nullable
+	private ClassPathNode findJvmClass(@Nonnull String internalName) {
+		Queue<Collection<? extends WorkspaceResource>> resourceQueue = new ArrayDeque<>();
+		Collection<? extends WorkspaceResource> resources = workspace.getAllResources(false);
+		do {
+			for (WorkspaceResource resource : resources) {
+				// We should be skipping internal resources, but just in case...
+				if (resource instanceof GeneratedPhantomWorkspaceResource || resource instanceof RuntimeWorkspaceResource)
+					continue;
+
+				// Check for multi-release classes, and if so, select the highest version not newer than the compiler target.
+				if (targetVersion >= 9) {
+					var entry = resource.getVersionedJvmClassBundles().floorEntry(targetVersion);
+					while (entry != null) {
+						VersionedJvmClassBundle bundle = entry.getValue();
+						JvmClassInfo classInfo = bundle.get(internalName);
+						if (classInfo != null)
+							return PathNodes.classPath(workspace, resource, bundle, classInfo);
+						entry = resource.getVersionedJvmClassBundles().lowerEntry(entry.getKey());
+					}
+				}
+
+				// If no multi-release class was found, check the non-versioned bundles.
+				for (JvmClassBundle bundle : resource.jvmClassBundles()) {
+					JvmClassInfo classInfo = bundle.get(internalName);
+					if (classInfo != null)
+						return PathNodes.classPath(workspace, resource, bundle, classInfo);
+				}
+
+				// Queue up embedded resources for further searching.
+				resourceQueue.add(resource.getEmbeddedResources().values());
+			}
+		} while ((resources = resourceQueue.poll()) != null);
+		return null;
+	}
+
+	/**
+	 * @param internalName
+	 * 		Name of a bootstrap <i>(Core java)</i> class.
+	 *
+	 * @return Class kind for a bootstrap class, or {@link PhantomTypeKind#CLASS} when the type cannot be loaded.
+	 */
+	@Nonnull
+	private static PhantomTypeKind bootstrapKind(@Nonnull String internalName) {
+		try {
+			Class<?> type = Class.forName(internalName.replace('/', '.'), false, null);
+			if (type.isAnnotation())
+				return PhantomTypeKind.ANNOTATION;
+			if (type.isEnum())
+				return PhantomTypeKind.ENUM;
+			return type.isInterface() ? PhantomTypeKind.INTERFACE : PhantomTypeKind.CLASS;
+		} catch (Throwable t) {
+			// Keep bootstrap names known even when the running JDK does not expose an optional module.
+			return PhantomTypeKind.CLASS;
+		}
+	}
+
+	private static boolean isBootstrapType(@Nullable String internalName) {
+		return internalName != null && internalName.startsWith("java/");
 	}
 }

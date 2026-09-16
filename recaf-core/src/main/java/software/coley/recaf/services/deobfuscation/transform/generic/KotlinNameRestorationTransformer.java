@@ -28,6 +28,8 @@ import java.util.Set;
  */
 @Dependent
 public class KotlinNameRestorationTransformer implements JvmClassTransformer {
+	public static final String IDENTIFIER = "restoration.kotlinname";
+
 	@Override
 	public void transform(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace,
 	                      @Nonnull WorkspaceResource resource, @Nonnull JvmClassBundle bundle,
@@ -82,8 +84,8 @@ public class KotlinNameRestorationTransformer implements JvmClassTransformer {
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Kotlin name restoration";
+	public String identifier() {
+		return IDENTIFIER;
 	}
 
 	@Nonnull

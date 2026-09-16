@@ -60,6 +60,7 @@ import software.coley.recaf.util.threading.ThreadPoolFactory;
 import software.coley.recaf.workspace.model.Workspace;
 import software.coley.recaf.workspace.model.bundle.Bundle;
 import software.coley.recaf.workspace.model.bundle.JvmClassBundle;
+import software.coley.recaf.workspace.model.resource.WorkspaceResource;
 
 import java.util.Collections;
 import java.util.HashSet;
@@ -149,6 +150,15 @@ public class JvmDecompilerPane extends AbstractDecompilePane {
 		JvmClassBundle bundle = (JvmClassBundle) path.getValueOfType(Bundle.class);
 		if (bundle == null)
 			throw new IllegalStateException("Bundle missing from class path node");
+		WorkspaceResource resource = path.getValueOfType(WorkspaceResource.class);
+		if (resource == null)
+			throw new IllegalStateException("Resource missing from class path node");
+
+		// Skip if it's an internal resource (not a user-provided class in the workspace).
+		if (resource.isInternal()) {
+			Animations.animateNotice(this, 1000); // Give some indication that the action was at least acknowledged.
+			return;
+		}
 
 		// Clear old errors emitted by compilation.
 		problemTracking.removeByPhase(ProblemPhase.BUILD);
@@ -188,7 +198,7 @@ public class JvmDecompilerPane extends AbstractDecompilePane {
 				//  - Removal/updating/insertion is OK, renaming is not.
 				//  - Because inners may have other inners we need to recursively collect inner classes
 				Map<String, InnerClassInfo> realInners = info.getInnerClasses().stream()
-						.filter(inner -> !inner.isExternalReference())
+						.filter(inner -> !inner.isExternalReference() && !inner.isSelfReference())
 						.collect(Collectors.toMap(InnerClassInfo::getInnerClassName, Function.identity()));
 				Set<String> names = new HashSet<>();
 				boolean recurseAddInners;

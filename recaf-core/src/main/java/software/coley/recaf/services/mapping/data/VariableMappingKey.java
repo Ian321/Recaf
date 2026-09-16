@@ -15,7 +15,8 @@ public class VariableMappingKey extends AbstractMappingKey {
 	private final String methodDesc;
 	private final String variableName;
 	private final String variableDesc;
-private final int variableIndex;
+	private final int variableIndex;
+
 	/**
 	 * @param owner
 	 * 		Class name.
@@ -27,7 +28,8 @@ private final int variableIndex;
 	 * 		Variable name.
 	 * @param variableDesc
 	 * 		Variable descriptor.
-	 * @param variableIndex  Variable index.
+	 * @param variableIndex
+	 * 		Variable index.
 	 */
 	public VariableMappingKey(String owner, String methodName, String methodDesc, String variableName, String variableDesc, int variableIndex) {
 		this.owner = owner;
@@ -114,13 +116,12 @@ private final int variableIndex;
 				&& variableIndex == that.variableIndex;
 	}
 
-
 	@Override
 	public int hashCode() {
 		int result = owner.hashCode();
 		result = 31 * result + methodName.hashCode();
 		result = 31 * result + Objects.hashCode(methodDesc);
-		result = 31 * result + variableName.hashCode();
+		result = 31 * result + Objects.hashCode(variableName);
 		result = 31 * result + Objects.hashCode(variableDesc);
 		result = 31 * result + Integer.hashCode(variableIndex);
 		return result;

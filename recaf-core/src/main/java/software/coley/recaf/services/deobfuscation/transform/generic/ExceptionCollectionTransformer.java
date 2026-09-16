@@ -32,6 +32,8 @@ import java.util.Set;
  */
 @Dependent
 public class ExceptionCollectionTransformer implements JvmClassTransformer, CollectionTransformer, Opcodes {
+	public static final String IDENTIFIER = "peephole.data.exceptioncollect";
+
 	private final Set<String> thrownExceptions = new HashSet<>();
 	private final InheritanceGraphService graphService;
 	private InheritanceGraph inheritanceGraph;
@@ -84,8 +86,8 @@ public class ExceptionCollectionTransformer implements JvmClassTransformer, Coll
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Exception metadata collection";
+	public String identifier() {
+		return IDENTIFIER;
 	}
 
 	/**

@@ -13,4 +13,10 @@ import org.objectweb.asm.tree.MethodNode;
  * 		Wrapped method.
  */
 public record ClassMethodPair(@Nonnull ClassNode classNode,
-                              @Nonnull MethodNode methodNode) {}
+                              @Nonnull MethodNode methodNode) {
+	@Nonnull
+	@Override
+	public String toString() {
+		return classNode.name + "." + methodNode.name + methodNode.desc;
+	}
+}

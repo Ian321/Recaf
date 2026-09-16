@@ -117,7 +117,7 @@ class WorkspaceExporterTest {
 	 */
 	@Test
 	void testLombokClassPrefixSuffixExport() throws IOException {
-		byte[] inputZipBytes = Files.readAllBytes(Paths.get("src/testFixtures/resources/name-prefix-suffix.jar"));
+		byte[] inputZipBytes = Files.readAllBytes(Paths.get("src/testFixtures/resources/samples/name-prefix-suffix.jar"));
 		WorkspaceResource resource = importer.importResource(ByteSources.wrap(inputZipBytes));
 		assertNotNull(resource.getJvmClassBundle().get("org/objectweb/asm/Constants"), "Missing ASM classes");
 		BasicWorkspace workspace = new BasicWorkspace(resource);
@@ -158,7 +158,7 @@ class WorkspaceExporterTest {
 
 	@Test
 	void testNameDifferenceExport() throws IOException {
-		byte[] inputZipBytes = Files.readAllBytes(Paths.get("src/testFixtures/resources/name-difference.zip"));
+		byte[] inputZipBytes = Files.readAllBytes(Paths.get("src/testFixtures/resources/samples/name-difference.zip"));
 		WorkspaceResource resource = importer.importResource(ByteSources.wrap(inputZipBytes));
 		assertNotNull(resource.getJvmClassBundle().get("org/objectweb/asm/Constants"), "Missing ASM classes");
 		BasicWorkspace workspace = new BasicWorkspace(resource);
@@ -200,7 +200,7 @@ class WorkspaceExporterTest {
 	void testArbitraryHeaderDataIsKeptAfterExport() throws IOException {
 		// Read a regular ZIP file and then pre-pend a lot of junk data to the front of it
 		Random random = new Random(2410L);
-		byte[] zipBytes = Files.readAllBytes(Paths.get("src/testFixtures/resources/name-difference.zip"));
+		byte[] zipBytes = Files.readAllBytes(Paths.get("src/testFixtures/resources/samples/name-difference.zip"));
 		byte[] junkBytes = new byte[(int) Math.pow(2, 16)];
 		random.nextBytes(junkBytes);
 		byte[] concatJunkThenZip = Bytes.concat(junkBytes, zipBytes);

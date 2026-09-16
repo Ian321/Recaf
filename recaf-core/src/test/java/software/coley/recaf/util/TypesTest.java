@@ -97,6 +97,14 @@ public class TypesTest {
 	}
 
 	@Test
+	void testParameterEndSlot() {
+		assertEquals(0, Types.parameterEndSlot(true, Type.getMethodType("()V")));
+		assertEquals(1, Types.parameterEndSlot(false, Type.getMethodType("()V")));
+		assertEquals(1, Types.parameterEndSlot(true, Type.getMethodType("(I)V")));
+		assertEquals(2, Types.parameterEndSlot(false, Type.getMethodType("(I)V")));
+	}
+
+	@Test
 	void testIsValidDesc() {
 		assertTrue(Types.isValidDesc("([I[[J[[I)V"), "method desc");
 		assertTrue(Types.isValidDesc("[I"), "array desc");

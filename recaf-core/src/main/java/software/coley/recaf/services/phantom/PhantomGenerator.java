@@ -10,8 +10,8 @@ import software.coley.recaf.info.Info;
 import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.info.builder.JvmClassInfoBuilder;
 import software.coley.recaf.services.Service;
-import software.coley.recaf.services.phantom.analysis.PhantomConstraintCollector;
 import software.coley.recaf.services.phantom.analysis.PhantomClassWriter;
+import software.coley.recaf.services.phantom.analysis.PhantomConstraintCollector;
 import software.coley.recaf.services.phantom.analysis.PhantomGenerationContext;
 import software.coley.recaf.services.phantom.analysis.PhantomHierarchyResolver;
 import software.coley.recaf.services.phantom.model.PhantomClassConstraint;
@@ -22,8 +22,8 @@ import software.coley.recaf.workspace.model.bundle.Bundle;
 import software.coley.recaf.workspace.model.resource.WorkspaceResourceBuilder;
 
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -37,6 +37,7 @@ import java.util.stream.Collectors;
 @EagerInitialization
 public class PhantomGenerator implements Service {
 	public static final String SERVICE_ID = "phantom-generator";
+	private static final int DEFAULT_TARGET_VERSION = 8;
 	private static final Logger logger = Logging.get(PhantomGenerator.class);
 	private final PhantomGeneratorConfig config;
 
@@ -55,8 +56,18 @@ public class PhantomGenerator implements Service {
 					return null;
 				}
 			}).thenAccept(generatedResource -> {
-				if (generatedResource != null)
-					workspace.addSupportingResource(generatedResource);
+				// Skip adding the generated phantom resource if:
+				// - No resource was generated
+				// - The generated resource has no classes
+				// - The workspace is no longer the current workspace
+				// - The workspace already has a phantom resource
+				if (generatedResource == null
+						|| generatedResource.getJvmClassBundle().isEmpty()
+						|| !workspaceManager.hasCurrentWorkspace()
+						|| workspaceManager.getCurrent() != workspace
+						|| workspace.getSupportingResources().stream().anyMatch(resource -> resource instanceof GeneratedPhantomWorkspaceResource))
+					return;
+				workspace.addSupportingResource(generatedResource);
 			});
 		});
 	}
@@ -83,12 +94,12 @@ public class PhantomGenerator implements Service {
 				.toList();
 		Map<String, JvmClassInfo> classMap = workspace.getPrimaryResource().jvmClassBundleStreamRecursive()
 				.flatMap(Bundle::stream)
-				.collect(Collectors.toMap(Info::getName, Function.identity(), (a, b) -> a, HashMap::new));
+				.collect(Collectors.toMap(Info::getName, Function.identity(), (a, b) -> a, TreeMap::new));
 		Map<String, JvmClassInfo> versionedClassMap = workspace.getPrimaryResource().versionedJvmClassBundleStreamRecursive()
 				.flatMap(Bundle::stream)
-				.collect(Collectors.toMap(Info::getName, Function.identity(), (a, b) -> b, HashMap::new));
+				.collect(Collectors.toMap(Info::getName, Function.identity(), (a, b) -> b, TreeMap::new));
 		versionedClassMap.forEach(classMap::putIfAbsent);
-		return generate(workspace, inputClasses, classMap);
+		return generate(workspace, inputClasses, classMap, DEFAULT_TARGET_VERSION);
 	}
 
 	/**
@@ -112,27 +123,56 @@ public class PhantomGenerator implements Service {
 			throws PhantomGenerationException {
 		Collection<JvmClassInfo> inputClasses = classes.stream().toList();
 		Map<String, JvmClassInfo> classMap = inputClasses.stream()
-				.collect(Collectors.toMap(Info::getName, Function.identity(), (a, b) -> a, HashMap::new));
-		return generate(workspace, inputClasses, classMap);
+				.collect(Collectors.toMap(Info::getName, Function.identity(), (a, b) -> a, TreeMap::new));
+		return generate(workspace, inputClasses, classMap, DEFAULT_TARGET_VERSION);
+	}
+
+	/**
+	 * Generates a resource containing phantoms for the given classes at a compiler-compatible class-file version.
+	 *
+	 * @param workspace
+	 * 		Workspace to pull class information from.
+	 * 		If a class that is required for compilation of a given class is in the workspace, then no phantom
+	 * 		for it will be generated in the resulting created resource.
+	 * @param classes
+	 * 		Classes to scan for missing references.
+	 * @param targetVersion
+	 * 		Java version that will consume the generated class files.
+	 *
+	 * @return Resource containing generated phantoms.
+	 *
+	 * @throws PhantomGenerationException
+	 * 		When generating phantoms failed.
+	 */
+	@Nonnull
+	public GeneratedPhantomWorkspaceResource createPhantomsForClasses(@Nonnull Workspace workspace,
+	                                                                  @Nonnull Collection<JvmClassInfo> classes,
+	                                                                  int targetVersion)
+			throws PhantomGenerationException {
+		Collection<JvmClassInfo> inputClasses = classes.stream().toList();
+		Map<String, JvmClassInfo> classMap = inputClasses.stream()
+				.collect(Collectors.toMap(Info::getName, Function.identity(), (a, b) -> a, TreeMap::new));
+		return generate(workspace, inputClasses, classMap, targetVersion);
 	}
 
 	@Nonnull
 	private GeneratedPhantomWorkspaceResource generate(@Nonnull Workspace workspace,
 	                                                   @Nonnull Collection<JvmClassInfo> inputClasses,
-	                                                   @Nonnull Map<String, JvmClassInfo> inputMap) throws PhantomGenerationException {
+	                                                   @Nonnull Map<String, JvmClassInfo> inputMap,
+	                                                   int targetVersion) throws PhantomGenerationException {
 		try {
 			PhantomGenerationContext context = new PhantomGenerationContext(workspace, inputMap,
-					config.getLenientConflictingHierarchies().getValue());
+					config.getLenientConflictingHierarchies().getValue(), targetVersion);
 			Map<String, PhantomClassConstraint> constraints = context.getConstraints();
 
 			PhantomConstraintCollector collector = new PhantomConstraintCollector(context);
 			inputClasses.forEach(collector::collect);
 			new PhantomHierarchyResolver(context).resolve();
 
-			Map<String, byte[]> generated = new HashMap<>();
+			Map<String, byte[]> generated = new TreeMap<>();
 			for (PhantomClassConstraint constraint : constraints.values()) {
 				if (!context.isKnown(constraint.getName()))
-					generated.put(constraint.getName(), PhantomClassWriter.write(constraint, constraints));
+					generated.put(constraint.getName(), PhantomClassWriter.write(constraint, constraints, targetVersion, context.getLookup()));
 			}
 			logger.debug("Phantom analysis complete, generated {} classes", generated.size());
 			return wrap(generated);
@@ -150,7 +190,9 @@ public class PhantomGenerator implements Service {
 	@Nonnull
 	public static GeneratedPhantomWorkspaceResource wrap(@Nonnull Map<String, byte[]> generated) {
 		BasicJvmClassBundle bundle = new BasicJvmClassBundle();
-		generated.forEach((name, phantom) -> bundle.initialPut(new JvmClassInfoBuilder(phantom).build()));
+		generated.entrySet().stream()
+				.sorted(Map.Entry.comparingByKey())
+				.forEach(entry -> bundle.initialPut(new JvmClassInfoBuilder(entry.getValue()).build()));
 		bundle.markInitialState();
 		return new GeneratedPhantomWorkspaceResource(new WorkspaceResourceBuilder()
 				.withJvmClassBundle(bundle));

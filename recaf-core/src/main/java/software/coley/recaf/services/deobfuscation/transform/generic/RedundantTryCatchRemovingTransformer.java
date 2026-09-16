@@ -14,6 +14,7 @@ import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.MultiANewArrayInsnNode;
 import org.objectweb.asm.tree.TryCatchBlockNode;
 import org.objectweb.asm.tree.TypeInsnNode;
+import org.objectweb.asm.tree.VarInsnNode;
 import org.objectweb.asm.tree.analysis.Frame;
 import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.services.inheritance.InheritanceGraph;
@@ -23,6 +24,7 @@ import software.coley.recaf.services.transform.ClassTransformer;
 import software.coley.recaf.services.transform.JvmClassTransformer;
 import software.coley.recaf.services.transform.JvmTransformerContext;
 import software.coley.recaf.services.transform.TransformationException;
+import software.coley.recaf.services.transform.TransformationParameter;
 import software.coley.recaf.util.AsmInsnUtil;
 import software.coley.recaf.util.Types;
 import software.coley.recaf.util.analysis.value.ArrayValue;
@@ -60,6 +62,8 @@ import static org.objectweb.asm.Opcodes.*;
  */
 @Dependent
 public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer {
+	public static final String IDENTIFIER = "peephole.flow.redundantcatch";
+
 	private static final String EX_NPE = "java/lang/NullPointerException";
 	private static final String EX_ASE = "java/lang/ArrayStoreException";
 	private static final String EX_AIOOBE = "java/lang/ArrayIndexOutOfBoundsException";
@@ -68,9 +72,16 @@ public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer
 	private static final String EX_CCE = "java/lang/ClassCastException";
 	private static final String EX_AE = "java/lang/ArithmeticException";
 
+	public static final String KEY_DELETE_JUNK_WORKSPACE_EXCEPTIONS = IDENTIFIER + ".delete-junk-workspace-exceptions";
+	private static final boolean DEFAULT_DELETE_JUNK_WORKSPACE_EXCEPTIONS = false;
+	private static final TransformationParameter<Boolean> DELETE_JUNK_WORKSPACE_EXCEPTIONS_PARAMETER =
+			new TransformationParameter<>(KEY_DELETE_JUNK_WORKSPACE_EXCEPTIONS, boolean.class, DEFAULT_DELETE_JUNK_WORKSPACE_EXCEPTIONS);
+
 	private final InheritanceGraphService graphService;
 	private InheritanceGraph inheritanceGraph;
 	private ExceptionCollectionTransformer exceptionCollector;
+	private JvmTransformerContext context;
+	private boolean deleteJunkWorkspaceExceptions;
 
 	@Inject
 	public RedundantTryCatchRemovingTransformer(@Nonnull InheritanceGraphService graphService) {
@@ -78,8 +89,12 @@ public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer
 	}
 
 	@Override
-	public void setup(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace) {
+	public void setup(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace) throws TransformationException {
+		this.context = context;
+
 		inheritanceGraph = graphService.getOrCreateInheritanceGraph(workspace);
+		exceptionCollector = context.getTransformer(ExceptionCollectionTransformer.class);
+		deleteJunkWorkspaceExceptions = context.getParameters().getBoolean(KEY_DELETE_JUNK_WORKSPACE_EXCEPTIONS, DEFAULT_DELETE_JUNK_WORKSPACE_EXCEPTIONS);
 	}
 
 	@Override
@@ -88,7 +103,6 @@ public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer
 	                      @Nonnull JvmClassInfo initialClassState) throws TransformationException {
 		boolean dirty = false;
 		ClassNode node = context.getNode(bundle, initialClassState);
-		exceptionCollector = context.getTransformer(ExceptionCollectionTransformer.class);
 		for (MethodNode method : node.methods) {
 			// Skip methods that have no code or no try-catch blocks, as they can't have redundant entries.
 			if (method.instructions == null || method.instructions.size() == 0)
@@ -103,6 +117,15 @@ public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer
 			} catch (Throwable t) {
 				throw new TransformationException("Error encountered when removing redundant try-catch blocks", t);
 			}
+		}
+
+		if (deleteJunkWorkspaceExceptions) {
+			// Check if this class is an exception.
+			// If it is, check if it is ever thrown in the workspace, then mark it for deletion.
+			String className = initialClassState.getName();
+			if (inheritanceGraph.isAssignableFrom("java/lang/Throwable", className)
+					&& isWorkspaceExceptionNeverThrown(className))
+				context.markClassForRemoval(initialClassState);
 		}
 
 		// If we changed anything, we need to update the class node and mark frames for recomputation.
@@ -120,8 +143,14 @@ public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Redundant try-catch removal";
+	public String identifier() {
+		return IDENTIFIER;
+	}
+
+	@Nonnull
+	@Override
+	public List<TransformationParameter<?>> getParameterDefinitions() {
+		return List.of(DELETE_JUNK_WORKSPACE_EXCEPTIONS_PARAMETER);
 	}
 
 	/**
@@ -148,12 +177,20 @@ public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer
 		List<TryCatchState> originalState = snapshotStates(instructions, method.tryCatchBlocks);
 
 		// Pruning occurs in multiple passes to allow later passes to take advantage of the results of earlier ones.
-		List<TryCatchBlockNode> tryCatches = mergeContinuousRanges(instructions, method.tryCatchBlocks);
+		List<TryCatchBlockNode> tryCatches = new ArrayList<>(method.tryCatchBlocks);
+		tryCatches.removeIf(block -> isTransparentRethrowHandler(instructions, block, method.tryCatchBlocks));
+		tryCatches = mergeContinuousRanges(instructions, tryCatches);
 		tryCatches = removeExactDuplicates(instructions, tryCatches);
 		tryCatches = removeShadowedRanges(instructions, tryCatches);
 
 		// Last pass requires frame analysis, so we do it after the cheaper passes to minimize the number of frames we need to analyze.
-		Frame<ReValue>[] frames = context.analyze(inheritanceGraph, declaringClass, method);
+		Frame<ReValue>[] frames;
+		try {
+			frames = context.analyze(inheritanceGraph, declaringClass, method);
+		} catch (Throwable t) {
+			// Can't analyze the method, so we can't prune any try-catch blocks.
+			return false;
+		}
 		tryCatches = removeImpossibleCatches(instructions, frames, tryCatches);
 
 		// If the final state is the same as the original state, we don't need to update anything.
@@ -165,6 +202,126 @@ public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer
 		method.tryCatchBlocks.clear();
 		method.tryCatchBlocks.addAll(tryCatches);
 		context.pruneDeadCode(declaringClass, method);
+		return true;
+	}
+
+	/**
+	 * @param instructions
+	 * 		Method instructions.
+	 * @param candidate
+	 * 		Try-catch block to inspect.
+	 * @param allBlocks
+	 * 		All try-catch blocks in the method.
+	 *
+	 * @return {@code true} when the try-catch block is a transparent rethrow handler that can be removed without changing behavior.
+	 */
+	private static boolean isTransparentRethrowHandler(@Nonnull InsnList instructions,
+	                                                   @Nonnull TryCatchBlockNode candidate,
+	                                                   @Nonnull List<TryCatchBlockNode> allBlocks) {
+		// Sanity check, handler must be present in the instruction list to be a valid candidate.
+		int handlerIndex = instructions.indexOf(candidate.handler);
+		if (handlerIndex < 0)
+			return false;
+
+		// It is impossible to have a rethrow handler with less than 3 instructions, since the minimum shape is:
+		// - astore X
+		// - aload X
+		// - athrow
+		if (instructions.size() < 3)
+			return false;
+
+		// A handler shared by multiple ranges may be intentional code even when one edge is redundant.
+		int sharedCount = 0;
+		for (TryCatchBlockNode block : allBlocks)
+			if (block.handler == candidate.handler)
+				sharedCount++;
+		if (sharedCount != 1)
+			return false;
+
+		// Build normal control-flow edges only (no exception edges) so the reachability walk below
+		// reflects application flow, not the exception edge we are considering removing.
+		Int2ObjectMap<List<Integer>> successors = new Int2ObjectMap<>(instructions.size());
+		Int2ObjectMap<List<Integer>> predecessors = new Int2ObjectMap<>(instructions.size());
+		MethodNode flowMethod = new MethodNode();
+		flowMethod.instructions = instructions;
+		flowMethod.tryCatchBlocks = Collections.emptyList();
+		AsmInsnUtil.populateFlowMaps(flowMethod, successors, predecessors, false);
+
+		// Mark everything application control-flow can reach from the method entry.
+		// Anything reachable must survive the removal of the exception edge, since it is live application code.
+		boolean[] reachable = new boolean[instructions.size()];
+		reachable[0] = true;
+		Deque<Integer> queue = new ArrayDeque<>();
+		queue.add(0);
+		while (!queue.isEmpty()) {
+			int current = queue.removeFirst();
+			for (int next : successors.getOrDefault(current, Collections.emptyList()))
+				if (next >= 0 && next < reachable.length && !reachable[next]) {
+					reachable[next] = true;
+					queue.addLast(next);
+				}
+		}
+
+		// Handler must not be reachable by normal application flow, otherwise it is not a transparent rethrow.
+		if (reachable[handlerIndex])
+			return false;
+
+		// If any reachable instruction has an edge into the handler, treat the
+		// handler as reachable application code rather than risk deleting a live rethrow.
+		for (int predecessor : predecessors.getOrDefault(handlerIndex, Collections.emptyList()))
+			if (predecessor >= 0 && predecessor < reachable.length && reachable[predecessor])
+				return false;
+
+		// Collect the handler body up to its terminating athrow.
+		// Only these instructions become dead code if the exception-table edge is removed.
+		List<Integer> bodyIndices = new ArrayList<>();
+		List<AbstractInsnNode> realInstructions = new ArrayList<>(3);
+		for (AbstractInsnNode current = candidate.handler; current != null; current = current.getNext()) {
+			int index = instructions.indexOf(current);
+			if (index < 0)
+				return false;
+			bodyIndices.add(index);
+
+			// Skip labels/metadata.
+			if (current.getOpcode() < 0)
+				continue;
+			realInstructions.add(current);
+
+			// Stop at the terminating athrow, or once three executable instructions have been seen since
+			// no transparent handler shape is longer than that.
+			if (current.getOpcode() == ATHROW || realInstructions.size() >= 3)
+				break;
+		}
+
+		// Only two handler shapes are transparent:
+		// - Immediate throw of the caught exception
+		// - Identity variable store/load then throw
+		boolean direct = realInstructions.size() == 1 && realInstructions.get(0).getOpcode() == ATHROW;
+		boolean identity = realInstructions.size() == 3
+				&& realInstructions.get(0).getOpcode() == ASTORE
+				&& realInstructions.get(1).getOpcode() == ALOAD
+				&& realInstructions.get(2).getOpcode() == ATHROW
+				&& realInstructions.get(0) instanceof VarInsnNode first
+				&& realInstructions.get(1) instanceof VarInsnNode second
+				&& first.var == second.var;
+		if (!direct && !identity)
+			return false;
+
+		// A normal edge into any part of the body would make this real application control flow, and
+		// removing the exception edge would then delete instructions that application flow executes.
+		Set<Integer> body = new HashSet<>(bodyIndices);
+		for (int bodyIndex : bodyIndices) {
+			if (reachable[bodyIndex])
+				return false;
+			for (int predecessor : predecessors.getOrDefault(bodyIndex, Collections.emptyList()))
+				if (predecessor >= 0
+						&& predecessor < reachable.length
+						&& reachable[predecessor]
+						&& !body.contains(predecessor))
+					return false;
+		}
+
+		// The entry only ever forwards to an unconditional rethrow, so dropping it preserves observable behavior.
 		return true;
 	}
 
@@ -792,7 +949,7 @@ public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer
 
 		// Finally check if the target type is assignable from the source type.
 		Type targetType = Type.getObjectType(cast.desc);
-		return !isAssignable(targetType, sourceType);
+		return !context.isAssignable(inheritanceGraph, targetType, sourceType);
 	}
 
 	/**
@@ -820,38 +977,7 @@ public class RedundantTryCatchRemovingTransformer implements JvmClassTransformer
 		if (valueType == null)
 			return true;
 
-		return !isAssignable(componentType, valueType);
-	}
-
-	/**
-	 * @param targetType
-	 * 		Target type.
-	 * @param valueType
-	 * 		Value type.
-	 *
-	 * @return {@code true} when the value type is assignable to the target type.
-	 */
-	private boolean isAssignable(@Nonnull Type targetType, @Nonnull Type valueType) {
-		// Base case, same type.
-		if (targetType.equals(valueType))
-			return true;
-
-		// Arrays can only be assigned to Object, and Object can be assigned from any array.
-		int targetSort = targetType.getSort();
-		int valueSort = valueType.getSort();
-		if (targetSort == Type.ARRAY || valueSort == Type.ARRAY)
-			return targetSort == Type.OBJECT && Types.OBJECT_TYPE.equals(targetType);
-
-		// For non-object types, these are not assignable between one another.
-		// This method is used strictly for checking casts and object type operations.
-		//
-		// If either type is not an object, then the cast is only valid if both types are the same primitive type,
-		// which is already handled by the equality check above.
-		if (targetSort != Type.OBJECT || valueSort != Type.OBJECT)
-			return false;
-
-		// Check inheritance graph for assignability of reference types.
-		return inheritanceGraph.isAssignableFrom(targetType.getInternalName(), valueType.getInternalName());
+		return !context.isAssignable(inheritanceGraph, componentType, valueType);
 	}
 
 	/**

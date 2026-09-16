@@ -364,6 +364,13 @@ class StringUtilTest {
 	}
 
 	@Test
+	void startsWithAny() {
+		assertTrue(StringUtil.startsWithAny("abc", "z", "x", "a"));
+		assertFalse(StringUtil.startsWithAny("abc", "z", "x", "y"));
+		assertFalse(StringUtil.startsWithAny("abc", Collections.emptyList()));
+	}
+
+	@Test
 	void testIsAnyNullOrEmpty() {
 		assertTrue(StringUtil.isAnyNullOrEmpty("", "a", null));
 		assertTrue(StringUtil.isAnyNullOrEmpty("", "a"));

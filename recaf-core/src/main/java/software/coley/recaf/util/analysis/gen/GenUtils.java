@@ -121,6 +121,8 @@ public class GenUtils {
 	protected static String toParameterMapper(@Nonnull Class<?> cls, @Nonnull String expression) {
 		if (isHostObjectType(cls))
 			return "requireRealInstance(" + expression + ", " + cls.getSimpleName() + ".class)";
+		if (cls.isArray())
+			return toMapper(cls) + "(" + expression + ")";
 		return toMapper(cls) + "((" + toValue(cls) + ")" + expression + ")";
 	}
 }

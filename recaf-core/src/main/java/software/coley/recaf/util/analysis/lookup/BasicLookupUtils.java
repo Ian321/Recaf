@@ -4,6 +4,7 @@ import jakarta.annotation.Nonnull;
 import jakarta.annotation.Nullable;
 import software.coley.recaf.util.Types;
 import software.coley.recaf.util.analysis.Nullness;
+import software.coley.recaf.util.analysis.eval.InstancedObjectValue;
 import software.coley.recaf.util.analysis.value.ArrayValue;
 import software.coley.recaf.util.analysis.value.DoubleValue;
 import software.coley.recaf.util.analysis.value.FloatValue;
@@ -60,7 +61,15 @@ public class BasicLookupUtils {
 	protected static double d(@Nonnull DoubleValue value) {return value.value().getAsDouble();}
 
 	@SuppressWarnings("all")
-	protected static String str(@Nonnull StringValue value) {return value.getText().get();}
+	protected static String str(@Nonnull ObjectValue value) {
+		if (value.isNull())
+			return null;
+		if (value instanceof StringValue string)
+			return string.getText().orElseThrow(() -> new IllegalArgumentException("Unknown string value"));
+		if (value instanceof InstancedObjectValue<?> instance && instance.getRealInstance() instanceof String string)
+			return string;
+		throw new IllegalArgumentException("Unsupported string unwrap: " + value);
+	}
 
 	protected static Object objl(@Nonnull ObjectValue value) {
 		// Yield object type literally instead of auto-casting at call-site with T.
@@ -80,6 +89,10 @@ public class BasicLookupUtils {
 		// Unwrap boxed values
 		if (value instanceof ObjectValueBoxImpl<?> box)
 			return (T) box.unbox();
+
+		// Instanced values already contain the exact object.
+		if (value instanceof InstancedObjectValue<?> instanced && instanced.getRealInstance() != null)
+			return (T) instanced.getRealInstance();
 
 		throw new IllegalArgumentException("Unsupported object unwrap: " + value);
 	}
@@ -301,6 +314,83 @@ public class BasicLookupUtils {
 				objects[i] = obj(sv);
 		}
 		return objects;
+	}
+
+	protected static boolean[] arrz(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arrz(array);
+		return hostArray(value, boolean[].class);
+	}
+
+	protected static byte[] arrb(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arrb(array);
+		return hostArray(value, byte[].class);
+	}
+
+	protected static short[] arrs(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arrs(array);
+		return hostArray(value, short[].class);
+	}
+
+	protected static char[] arrc(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arrc(array);
+		return hostArray(value, char[].class);
+	}
+
+	protected static int[] arri(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arri(array);
+		return hostArray(value, int[].class);
+	}
+
+	protected static float[] arrf(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arrf(array);
+		return hostArray(value, float[].class);
+	}
+
+	protected static double[] arrd(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arrd(array);
+		return hostArray(value, double[].class);
+	}
+
+	protected static long[] arrj(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arrj(array);
+		return hostArray(value, long[].class);
+	}
+
+	protected static String[] arrstr(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arrstr(array);
+		Object hostValue = hostArray(value, Object[].class);
+		if (hostValue instanceof String[] strings)
+			return strings;
+		Object[] objects = (Object[]) hostValue;
+		String[] strings = new String[objects.length];
+		for (int i = 0; i < objects.length; i++)
+			strings[i] = objects[i] == null ? null : objects[i].toString();
+		return strings;
+	}
+
+	protected static Object[] arrobj(@Nonnull ReValue value) {
+		if (value instanceof ArrayValue array)
+			return arrobj(array);
+		return hostArray(value, Object[].class);
+	}
+
+	@Nonnull
+	private static <T> T hostArray(@Nonnull ReValue value, @Nonnull Class<T> type) {
+		if (value instanceof InstancedObjectValue<?> instanced) {
+			Object realInstance = instanced.getRealInstance();
+			if (type.isInstance(realInstance))
+				return type.cast(realInstance);
+		}
+		throw new IllegalArgumentException("Expected host-backed " + type.getTypeName() + ": " + value);
 	}
 
 	@Nonnull

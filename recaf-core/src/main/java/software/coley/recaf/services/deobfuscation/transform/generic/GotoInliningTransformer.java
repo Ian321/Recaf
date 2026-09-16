@@ -19,6 +19,7 @@ import software.coley.recaf.services.transform.ClassTransformer;
 import software.coley.recaf.services.transform.JvmClassTransformer;
 import software.coley.recaf.services.transform.JvmTransformerContext;
 import software.coley.recaf.services.transform.TransformationException;
+import software.coley.recaf.services.transform.TransformationParameter;
 import software.coley.recaf.workspace.model.Workspace;
 import software.coley.recaf.workspace.model.bundle.JvmClassBundle;
 import software.coley.recaf.workspace.model.resource.WorkspaceResource;
@@ -40,9 +41,12 @@ import static software.coley.recaf.util.AsmInsnUtil.*;
  */
 @Dependent
 public class GotoInliningTransformer implements JvmClassTransformer {
-	/** Key for whether to abort inlining when a block begins with a backwards switch jump. */
-	public static final String KEY_BACKWARDS_SWITCH_FLOW = "goto-inlining.backwards-switch-flow";
+	public static final String IDENTIFIER = "peephole.flow.gotoinline";
+	public static final String KEY_BACKWARDS_SWITCH_FLOW = IDENTIFIER + ".backwards-switch-flow";
+
 	private static final boolean DEFAULT_BACKWARDS_SWITCH_FLOW = false;
+	private static final TransformationParameter<Boolean> BACKWARDS_SWITCH_FLOW_PARAMETER =
+			new TransformationParameter<>(KEY_BACKWARDS_SWITCH_FLOW, boolean.class, DEFAULT_BACKWARDS_SWITCH_FLOW);
 
 	private boolean backwardsSwitchFlow;
 
@@ -317,8 +321,14 @@ public class GotoInliningTransformer implements JvmClassTransformer {
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Goto inlining";
+	public String identifier() {
+		return IDENTIFIER;
+	}
+
+	@Nonnull
+	@Override
+	public List<TransformationParameter<?>> getParameterDefinitions() {
+		return List.of(BACKWARDS_SWITCH_FLOW_PARAMETER);
 	}
 
 	/**

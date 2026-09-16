@@ -9,6 +9,8 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.services.inheritance.InheritanceGraph;
@@ -24,21 +26,38 @@ import software.coley.recaf.util.analysis.eval.EvaluationResult;
 import software.coley.recaf.util.analysis.eval.EvaluationThrowsResult;
 import software.coley.recaf.util.analysis.eval.EvaluationYieldResult;
 import software.coley.recaf.util.analysis.eval.Evaluator;
+import software.coley.recaf.util.analysis.eval.FieldCache;
 import software.coley.recaf.util.analysis.eval.FieldCacheManager;
 import software.coley.recaf.util.analysis.eval.InstancedObjectValue;
 import software.coley.recaf.util.analysis.lookup.InvokeVirtualLookup;
+import software.coley.recaf.util.analysis.value.ArrayValue;
 import software.coley.recaf.util.analysis.value.IntValue;
 import software.coley.recaf.util.analysis.value.LongValue;
 import software.coley.recaf.util.analysis.value.ObjectValue;
 import software.coley.recaf.util.analysis.value.ReValue;
 import software.coley.recaf.util.analysis.value.StringValue;
 import software.coley.recaf.util.analysis.value.ThrowableValue;
+import software.coley.recaf.util.analysis.value.UninitializedValue;
+import software.coley.recaf.util.analysis.value.impl.ArrayValueImpl;
 import software.coley.recaf.workspace.model.Workspace;
 
+import javax.crypto.AEADBadTagException;
+import javax.crypto.Cipher;
+import javax.crypto.CipherInputStream;
+import javax.crypto.CipherOutputStream;
+import javax.crypto.KeyGenerator;
+import javax.crypto.Mac;
+import javax.crypto.SecretKey;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -111,6 +130,126 @@ public class EvaluatorTest extends TransformerTestBase {
 	}
 
 	@Test
+	void testHostBackedArrayOperations() {
+		String compiled = compile("""
+				static int parameterLength(int[] values) { return values.length; }
+				static int hostLength(int[] values) { return values.length; }
+				static int hostIntLoad(int[] values) { return values[1]; }
+				static int hostBooleanLoad(boolean[] values) { return values[0] ? 1 : 0; }
+				static int hostIntStore(int[] values) {
+				    values[1] = 7;
+				    return values[1];
+				}
+				static String hostObjectLoad(String[] values) { return values[1]; }
+				static String hostObjectStore(String[] values) {
+				    values[0] = "changed";
+				    return values[0];
+				}
+				static int hostArrayInstanceOf(String[] values) {
+				    Object value = values;
+				    return value instanceof Object[] ? 1 : 0;
+				}
+				static int hostPrimitiveArrayInstanceOf(int[] values) {
+				    Object value = values;
+				    return value instanceof Object[] ? 1 : 0;
+				}
+				static int hostGoodArrayCast(String[] values) {
+				    Object value = values;
+				    Object[] cast = (Object[]) value;
+				    return cast.length;
+				}
+				static int hostBadArrayCast(int[] values) {
+				    try {
+				        Object value = values;
+				        Object[] cast = (Object[]) value;
+				        return cast.length;
+				    } catch (ClassCastException ex) {
+				        return 10;
+				    }
+				}
+				static int hostCaughtLoad(int[] values) {
+				    try { return values[values.length]; }
+				    catch (ArrayIndexOutOfBoundsException ex) { return 7; }
+				}
+				static int hostCaughtStore(int[] values) {
+				    try { values[values.length] = 7; }
+				    catch (ArrayIndexOutOfBoundsException ex) { return 8; }
+				    return 0;
+				}
+				static int hostCaughtReferenceStore(String[] values) {
+				    try {
+				        Object[] widened = values;
+				        widened[0] = Integer.valueOf(1);
+				    } catch (ArrayStoreException ex) {
+				        return 9;
+				    }
+				    return 0;
+				}
+				static String hostBuilder(char[] values) {
+				    return new StringBuilder().append(values).toString();
+				}
+				static int hostArraycopy(int[] source, int[] destination) {
+				    System.arraycopy(source, 0, destination, 0, 2);
+				    return destination[1];
+				}
+				""");
+
+		// There are a number of cases in our evaluator where we can get an instanced array value, rather than use the ArrayValue type.
+		// This is a shotgun test covering a number of those cases to ensure the evaluator can properly handle the arrays even if
+		// represented as an instanced object value.
+		ReValue unmappedBooleanArray = new InstancedObjectValue<>(new boolean[]{true}).unmap();
+		ReValue unknownLength = evaluate(compiled, "parameterLength", "([I)I", null, List.of(new InstancedObjectValue<>(Type.getType("[I"))));
+		assertTrue(assertInstanceOf(IntValue.class, unknownLength).value().isEmpty());
+		assertTrue(unmappedBooleanArray.hasKnownValue());
+		assertIntValue(2, evaluate(compiled, "hostLength", "([I)I", null, List.of(new InstancedObjectValue<>(new int[]{10, 20}))));
+		assertIntValue(20, evaluate(compiled, "hostIntLoad", "([I)I", null, List.of(new InstancedObjectValue<>(new int[]{10, 20}))));
+		assertIntValue(1, evaluate(compiled, "hostBooleanLoad", "([Z)I", null, List.of(new InstancedObjectValue<>(new boolean[]{true}))));
+		assertIntValue(1, ((ArrayValue) unmappedBooleanArray).getValue(0));
+		assertIntValue(7, evaluate(compiled, "hostIntStore", "([I)I", null, List.of(new InstancedObjectValue<>(new int[]{10, 20}))));
+		assertStringValue("right", evaluate(compiled, "hostObjectLoad", "([Ljava/lang/String;)Ljava/lang/String;", null, List.of(new InstancedObjectValue<>(new String[]{"left", "right"}))));
+		assertStringValue("changed", evaluate(compiled, "hostObjectStore", "([Ljava/lang/String;)Ljava/lang/String;", null, List.of(new InstancedObjectValue<>(new String[]{"left", "right"}))));
+		assertIntValue(1, evaluate(compiled, "hostArrayInstanceOf", "([Ljava/lang/String;)I", null, List.of(new InstancedObjectValue<>(new String[]{"left", "right"}))));
+		assertIntValue(0, evaluate(compiled, "hostPrimitiveArrayInstanceOf", "([I)I", null, List.of(new InstancedObjectValue<>(new int[]{10, 20}))));
+		assertIntValue(2, evaluate(compiled, "hostGoodArrayCast", "([Ljava/lang/String;)I", null, List.of(new InstancedObjectValue<>(new String[]{"left", "right"}))));
+		assertIntValue(10, evaluate(compiled, "hostBadArrayCast", "([I)I", null, List.of(new InstancedObjectValue<>(new int[]{10, 20}))));
+		assertIntValue(7, evaluate(compiled, "hostCaughtLoad", "([I)I", null, List.of(new InstancedObjectValue<>(new int[]{10, 20}))));
+		assertIntValue(8, evaluate(compiled, "hostCaughtStore", "([I)I", null, List.of(new InstancedObjectValue<>(new int[]{10, 20}))));
+		assertIntValue(9, evaluate(compiled, "hostCaughtReferenceStore", "([Ljava/lang/String;)I", null, List.of(new InstancedObjectValue<>(new String[]{"left", "right"}))));
+		assertStringValue("ab", evaluate(compiled, "hostBuilder", "([C)Ljava/lang/String;", null, List.of(new InstancedObjectValue<>(new char[]{'a', 'b'}))));
+		assertIntValue(20, evaluate(compiled, "hostArraycopy", "([I[I)I", null, List.of(new InstancedObjectValue<>(new int[]{10, 20}), new InstancedObjectValue<>(new int[]{0, 0}))));
+	}
+
+	@Test
+	void testTrackedArrayContainmentHints() {
+		// Array of Object[] with String values, no nested arrays.
+		Type objectArrayType = Type.getType("[Ljava/lang/Object;");
+		ArrayValue objectArrayValue = new ArrayValueImpl(objectArrayType, Nullness.NOT_NULL, 2, index -> ObjectValue.string("value-" + index));
+		assertFalse(objectArrayValue.containsTrackedSubArray());
+
+		// Array of Object[] with nested int[] arrays, should be tracked.
+		ArrayValue nestedObjects = new ArrayValueImpl(objectArrayType, Nullness.NOT_NULL, 1, index -> ArrayValue.of(Type.getType("[I"), Nullness.NOT_NULL, 1));
+		assertTrue(nestedObjects.containsTrackedSubArray());
+
+		// Array of Object[] with unknown values, should not be tracked. Values aren't tracked.
+		ArrayValue unknownObjects = ArrayValue.of(objectArrayType, Nullness.UNKNOWN);
+		assertFalse(unknownObjects.containsTrackedSubArray());
+
+		// Array of String[] with unknown values, should not be tracked. Values aren't tracked.
+		ArrayValue strings = ArrayValue.of(Type.getType("[Ljava/lang/String;"), Nullness.UNKNOWN);
+		assertFalse(strings.containsTrackedSubArray());
+
+		// Array of Object[] with a nested int[] array. Both the object + int arrays have value tracking, so the outer array should indicate it contains a tracked sub-array.
+		ArrayValue nestedArray = ArrayValue.of(Type.getType("[I"), Nullness.NOT_NULL, 1);
+		ArrayValue nestedReplacement = nestedArray.setValue(0, IntValue.VAL_1);
+		ArrayValue outer = new ArrayValueImpl(objectArrayType, Nullness.NOT_NULL, 1, index -> nestedArray);
+		ArrayValue updatedOuter = outer.updatedCopyIfContained(nestedArray, nestedReplacement);
+		assertNotSame(outer, updatedOuter);
+		assertTrue(outer.containsTrackedSubArray());
+		assertSame(nestedReplacement, updatedOuter.getValue(0));
+		assertSame(objectArrayValue, objectArrayValue.updatedCopyIfContained(nestedArray, nestedReplacement));
+	}
+
+	@Test
 	void testXorString() {
 		String src = """
 				.method static decrypt (Ljava/lang/String;I)Ljava/lang/String; {
@@ -155,6 +294,34 @@ public class EvaluatorTest extends TransformerTestBase {
 		ReValue retVal = evaluate(src, "decrypt", "(Ljava/lang/String;I)Ljava/lang/String;", null,
 				List.of(ObjectValue.string("㘯㘂㘋㘋㘈㙇㘐㘈㘕㘋㘃"), IntValue.of(0b11011001100111)));
 		assertStringValue("Hello world", retVal);
+	}
+
+	@Test
+	void testUtf8String() {
+		String src = """
+				.method static decode ()Ljava/lang/String; {
+				    code: {
+				    A:
+				        new java/lang/String
+				        dup
+				        iconst_2
+				        newarray byte
+				        dup
+				        iconst_0
+				        bipush 72
+				        bastore
+				        dup
+				        iconst_1
+				        bipush 105
+				        bastore
+				        getstatic java/nio/charset/StandardCharsets.UTF_8 Ljava/nio/charset/Charset;
+				        invokespecial java/lang/String.<init> ([BLjava/nio/charset/Charset;)V
+				        areturn
+				    B:
+				    }
+				}
+				""";
+		assertStringValue("Hi", evaluate(src, "decode", "()Ljava/lang/String;", null, List.of()));
 	}
 
 	@Test
@@ -368,14 +535,14 @@ public class EvaluatorTest extends TransformerTestBase {
 		Evaluator evaluator = createEvaluator();
 		List<String> thrown = new ArrayList<>();
 		EvaluationListener listener = new EvaluationListener() {
-			private final Map<MethodNode, AbstractInsnNode> lastInstruction = new IdentityHashMap<>();
+			private final Map<ReFrame, AbstractInsnNode> lastInstruction = new IdentityHashMap<>();
 
 			@Override
 			public void onInstruction(@Nullable ClassNode classNode,
 			                          @Nullable MethodNode methodNode,
 			                          @Nonnull AbstractInsnNode instruction,
 			                          @Nonnull ReFrame frame) {
-				lastInstruction.put(methodNode, instruction);
+				lastInstruction.put(frame, instruction);
 			}
 
 			@Override
@@ -384,7 +551,7 @@ public class EvaluatorTest extends TransformerTestBase {
 			                          @Nonnull ReFrame frame,
 			                          @Nonnull ReValue exception,
 			                          @Nonnull List<ClassMethodPair> stack) {
-				AbstractInsnNode throwingInsn = lastInstruction.get(methodNode).getNext();
+				AbstractInsnNode throwingInsn = lastInstruction.get(frame).getNext();
 				thrown.add(String.join(":", stackMethodNames(stack)) + ":" + JvmPrinterUtil.toString(throwingInsn) + ":" + exception);
 			}
 		};
@@ -480,6 +647,26 @@ public class EvaluatorTest extends TransformerTestBase {
 				""", Predicate.class);
 		ReValue retVal = evaluate(compiled, "test", "()Z", null, List.of());
 		assertIntValue(1, retVal);
+	}
+
+	@Test
+	void testSimulatedEnumConstruction() {
+		String compiled = compileFull(CLASS_NAME, """
+				enum Example {
+				    ALPHA(4), BETA(9);
+				
+				    final int value;
+				
+				    Example(int value) { this.value = value; }
+				
+				    static String run() {
+				        return ALPHA.name() + ":" + ALPHA.ordinal() + ":" + ALPHA.value + ";"
+				            + BETA.name() + ":" + BETA.ordinal() + ":" + BETA.value;
+				    }
+				}
+				""");
+		EvaluationYieldResult result = assertInstanceOf(EvaluationYieldResult.class, evaluateResult(compiled, "run", "()Ljava/lang/String;", null, List.of(), true));
+		assertStringValue("ALPHA:0:4;BETA:1:9", result.value());
 	}
 
 	@Test
@@ -700,16 +887,12 @@ public class EvaluatorTest extends TransformerTestBase {
 	}
 
 	@Test
-	void testBase64ScalarAndMime() {
+	void testBase64AndMime() {
 		String compiled = compile("""
 				static String basic() {
 				    byte[] input = "Hello".getBytes();
 				    String encoded = Base64.getEncoder().encodeToString(input);
 				    return new String(Base64.getDecoder().decode(encoded));
-				}
-				static String scalar() {
-				    byte[] input = "Hello".getBytes();
-				    return new String(Base64.getDecoder().decode(Base64.getEncoder().encode(input)));
 				}
 				static String url() {
 				    String encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(">>>>".getBytes());
@@ -729,7 +912,6 @@ public class EvaluatorTest extends TransformerTestBase {
 
 		// Verify we can round-trip 'Hello'
 		assertStringValue("Hello", evaluate(compiled, "basic", "()Ljava/lang/String;", null, List.of()));
-		assertStringValue("Hello", evaluate(compiled, "scalar", "()Ljava/lang/String;", null, List.of()));
 
 		// Verify URL-safe encoding and decoding of '>>>>' with no padding.
 		assertStringValue("Pj4-Pg:>>>>", evaluate(compiled, "url", "()Ljava/lang/String;", null, List.of()));
@@ -738,6 +920,290 @@ public class EvaluatorTest extends TransformerTestBase {
 		assertStringValue("SGVsbG9Xb3JsZA==", evaluate(compiled, "mimeDefault", "()Ljava/lang/String;", null, List.of()));
 		assertStringValue("SGVs!bG9X!b3Js!ZA==", evaluate(compiled, "mimeCustom", "()Ljava/lang/String;", null, List.of()));
 		assertStringValue("HelloWorld", evaluate(compiled, "mimeDecode", "()Ljava/lang/String;", null, List.of()));
+	}
+
+	@Test
+	void testAesCtrStringEncryption() {
+		// Compile a deterministic AES/CTR round-trip with a fixed key and IV.
+		// It's a simple setup that some obfuscators will have variations of.
+		// Most of the underlying API's should be supported given this baseline works.
+		String compiled = compile("""
+				static String run() throws Exception {
+				    byte[] key = "0123456789abcdef".getBytes();
+				    byte[] nonce = "123456789012".getBytes();
+				    byte[] iv = new byte[16];
+				    System.arraycopy(nonce, 0, iv, 0, nonce.length);
+				
+				    SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+				    IvParameterSpec ivSpec = new IvParameterSpec(iv);
+				
+				    Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+				    cipher.init(1, keySpec, ivSpec);
+				
+				    byte[] ciphertext = cipher.doFinal("Hello World CTR".getBytes());
+				    cipher.init(2, keySpec, ivSpec);
+				
+				    byte[] plaintext = cipher.doFinal(ciphertext);
+				    return Base64.getEncoder().encodeToString(ciphertext) + ":" + new String(plaintext);
+				}
+				""", Cipher.class, IvParameterSpec.class, SecretKeySpec.class, Base64.class);
+
+		// Check the exact ciphertext as well as the decrypted plaintext.
+		assertStringValue("WXYAnhr5X0Gp7HA3HBz3:Hello World CTR", evaluate(compiled, "run", "()Ljava/lang/String;", null, List.of()));
+	}
+
+	@Test
+	void testThrowablePrintStackTrace() {
+		// Previously the evaluator would fail to evaluate a method that caught an exception and called printStackTrace() on it.
+		// Our exception handling model should support any typed impl of printStackTrace without failing to evaluate the method.
+		String compiled = compile("""
+				static String run() {
+				    try {
+				        throw new IllegalStateException();
+				    } catch (IllegalStateException ex) {
+				        ex.printStackTrace();
+				        return "caught";
+				    }
+				}
+				""");
+		assertStringValue("caught", evaluate(compiled, "run", "()Ljava/lang/String;", null, List.of()));
+	}
+
+	@Test
+	void testAesGcmParameterSpecs() {
+		String compiled = compile("""
+				static String direct() throws Exception {
+				    byte[] key = new byte[16];
+				    byte[] iv = new byte[12];
+				    Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+				    cipher.init(1, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, iv));
+				    return Base64.getEncoder().encodeToString(cipher.doFinal(new byte[0]));
+				}
+				static String ranged() throws Exception {
+				    byte[] key = new byte[16];
+				    byte[] paddedIv = new byte[14];
+				    Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+				    cipher.init(1, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, paddedIv, 1, 12));
+				    return Base64.getEncoder().encodeToString(cipher.doFinal(new byte[0]));
+				}
+				""", Base64.class, Cipher.class, GCMParameterSpec.class, SecretKeySpec.class);
+
+		// Both constructor forms must represent the same twelve-byte all-zero IV.
+		assertStringValue("WOL8zvp+MGE2fx1XpOdFWg==", evaluate(compiled, "direct", "()Ljava/lang/String;", null, List.of()));
+		assertStringValue("WOL8zvp+MGE2fx1XpOdFWg==", evaluate(compiled, "ranged", "()Ljava/lang/String;", null, List.of()));
+	}
+
+	@Test
+	void testAesGcmAuthenticationFailure() {
+		String compiled = compile("""
+				static int run() throws Exception {
+				    byte[] encrypted = Base64.getDecoder().decode("WOL8zvp+MGE2fx1XpOdFWg==");
+				    encrypted[0] ^= 1;
+				    Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+				    cipher.init(2, new SecretKeySpec(new byte[16], "AES"), new GCMParameterSpec(128, new byte[12]));
+				    try {
+				        cipher.doFinal(encrypted);
+				        return 0;
+				    } catch (AEADBadTagException ex) {
+				        return 1;
+				    }
+				}
+				""", AEADBadTagException.class, Base64.class, Cipher.class, GCMParameterSpec.class, SecretKeySpec.class);
+
+		// Authentication failures must remain catchable evaluated exceptions rather than generic failures.
+		assertIntValue(1, evaluate(compiled, "run", "()I", null, List.of()));
+	}
+
+	@Test
+	void testHmacSha256() {
+		String compiled = compile("""
+				static Mac mac() throws Exception {
+				    Mac mac = Mac.getInstance("HmacSHA256");
+				    mac.init(new SecretKeySpec("key".getBytes("UTF-8"), "HmacSHA256"));
+				    return mac;
+				}
+				static String whole() throws Exception {
+				    Mac mac = mac();
+				    mac.update("The quick brown ".getBytes("UTF-8"));
+				    mac.update("fox jumps over the lazy dog".getBytes("UTF-8"));
+				    return Base64.getEncoder().encodeToString(mac.doFinal());
+				}
+				static String ranged() throws Exception {
+				    Mac mac = mac();
+				    byte[] message = "The quick brown fox jumps over the lazy dog".getBytes("UTF-8");
+				    mac.update(message, 0, 20);
+				    mac.update(message, 20, message.length - 20);
+				    return Base64.getEncoder().encodeToString(mac.doFinal());
+				}
+				static String finalInput() throws Exception {
+				    Mac mac = mac();
+				    mac.update("The quick brown fox ".getBytes("UTF-8"));
+				    return Base64.getEncoder().encodeToString(mac.doFinal("jumps over the lazy dog".getBytes("UTF-8")));
+				}
+				""", Base64.class, Mac.class, SecretKeySpec.class);
+
+		// Whole, ranged, and final-input updates must all preserve the standard HMAC result.
+		String expected = "97yD9DBThCSxMpjmqm+xQ+9NWaFJRhdZl0edvC0aPNg=";
+		assertStringValue(expected, evaluate(compiled, "whole", "()Ljava/lang/String;", null, List.of()));
+		assertStringValue(expected, evaluate(compiled, "ranged", "()Ljava/lang/String;", null, List.of()));
+		assertStringValue(expected, evaluate(compiled, "finalInput", "()Ljava/lang/String;", null, List.of()));
+	}
+
+	@Test
+	void testKeyGeneratorAndSecureRandom() {
+		// Compile key generation with a host-backed SecureRandom supplying the provider randomness.
+		String compiled = compile("""
+				static String run() throws Exception {
+				    SecureRandom random = new SecureRandom();
+				    byte[] randomBytes = new byte[16];
+				    random.nextBytes(randomBytes);
+				    KeyGenerator generator = KeyGenerator.getInstance("AES");
+				    generator.init(128, random);
+				    SecretKey key = generator.generateKey();
+				    Cipher cipher = Cipher.getInstance("AES/ECB/PKCS5Padding");
+				    cipher.init(1, key);
+				    byte[] ciphertext = cipher.doFinal("Hello Generated Key".getBytes());
+				    cipher.init(2, key);
+				    return randomBytes.length + ":" + new String(cipher.doFinal(ciphertext));
+				}
+				""", Cipher.class, KeyGenerator.class, SecureRandom.class, SecretKey.class);
+
+		// The random bytes only need to be produced, while the generated key must complete a real cipher round-trip.
+		assertStringValue("16:Hello Generated Key", evaluate(compiled, "run", "()Ljava/lang/String;", null, List.of()));
+	}
+
+	@Test
+	void testSecureRandomStaticSupplier() {
+		String compiled = compile("""
+				static boolean run() throws Exception {
+				    return SecureRandom.getInstanceStrong() != null;
+				}
+				""", SecureRandom.class);
+
+		// The evaluator should materialize the JCA-provided strong random source instead of yielding an unknown value.
+		assertIntValue(1, evaluate(compiled, "run", "()Z", null, List.of()));
+	}
+
+	@Test
+	void testSecretKeyFactoryAndPbeKeySpec() {
+		// Compile password-derived AES key creation using the JCA PBKDF2 path.
+		String compiled = compile("""
+						static String run() throws Exception {
+						    PBEKeySpec spec = new PBEKeySpec("password".toCharArray(), "12345678".getBytes(), 1024, 128);
+						    SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+						    SecretKey derived = factory.generateSecret(spec);
+						    SecretKey key = new SecretKeySpec(derived.getEncoded(), "AES");
+						    Cipher cipher = Cipher.getInstance("AES/ECB/PKCS5Padding");
+						    cipher.init(1, key);
+						    byte[] ciphertext = cipher.doFinal("Hello PBE".getBytes());
+						    cipher.init(2, key);
+						    return Base64.getEncoder().encodeToString(ciphertext) + ":" + new String(cipher.doFinal(ciphertext));
+						}
+						""", Cipher.class, SecretKey.class, SecretKeyFactory.class, PBEKeySpec.class,
+				SecretKeySpec.class, Base64.class);
+
+		// The fixed password, salt, iteration count, and key length make the derived-key ciphertext deterministic.
+		assertStringValue("2ip1taoP+HiqUPpFJAWViw==:Hello PBE",
+				evaluate(compiled, "run", "()Ljava/lang/String;", null, List.of()));
+	}
+
+	@Test
+	void testCipherUpdate() {
+		// Compile both byte-array update overloads and finish each stream with the no-argument doFinal method.
+		String compiled = compile("""
+						static String ranged() throws Exception {
+						    byte[] key = "0123456789abcdef".getBytes();
+						    byte[] iv = new byte[16];
+						    System.arraycopy("123456789012".getBytes(), 0, iv, 0, 12);
+						    SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+						    IvParameterSpec ivSpec = new IvParameterSpec(iv);
+						    byte[] input = "Hello Cipher Update".getBytes();
+						    Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+						    cipher.init(1, keySpec, ivSpec);
+						    ByteArrayOutputStream output = new ByteArrayOutputStream();
+						    output.write(cipher.update(input, 0, 5));
+						    output.write(cipher.update(input, 5, input.length - 5));
+						    output.write(cipher.doFinal());
+						    byte[] ciphertext = output.toByteArray();
+						    cipher.init(2, keySpec, ivSpec);
+						    return Base64.getEncoder().encodeToString(ciphertext) + ":" + new String(cipher.doFinal(ciphertext));
+						}
+						static String rangedFinal() throws Exception {
+						    byte[] key = "0123456789abcdef".getBytes();
+						    byte[] iv = new byte[16];
+						    System.arraycopy("123456789012".getBytes(), 0, iv, 0, 12);
+						    SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+						    IvParameterSpec ivSpec = new IvParameterSpec(iv);
+						    byte[] input = "Hello Cipher Update".getBytes();
+						    Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+						    cipher.init(1, keySpec, ivSpec);
+						    byte[] ciphertext = cipher.doFinal(input, 0, input.length);
+						    cipher.init(2, keySpec, ivSpec);
+						    return Base64.getEncoder().encodeToString(ciphertext) + ":" +
+						            new String(cipher.doFinal(ciphertext, 0, ciphertext.length));
+						}
+						static String whole() throws Exception {
+						    byte[] key = "0123456789abcdef".getBytes();
+						    byte[] iv = new byte[16];
+						    System.arraycopy("123456789012".getBytes(), 0, iv, 0, 12);
+						    SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+						    IvParameterSpec ivSpec = new IvParameterSpec(iv);
+						    byte[] input = "Hello Cipher Update".getBytes();
+						    Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+						    cipher.init(1, keySpec, ivSpec);
+						    ByteArrayOutputStream output = new ByteArrayOutputStream();
+						    output.write(cipher.update(input));
+						    output.write(cipher.doFinal());
+						    byte[] ciphertext = output.toByteArray();
+						    cipher.init(2, keySpec, ivSpec);
+						    return Base64.getEncoder().encodeToString(ciphertext) + ":" + new String(cipher.doFinal(ciphertext));
+						}
+						""", ByteArrayOutputStream.class, Cipher.class, IvParameterSpec.class,
+				SecretKeySpec.class, Base64.class);
+
+		// All three update signatures must produce the same deterministic ciphertext and plaintext.
+		assertStringValue("WXYAnhr5S0er6HFlfx3V2IINiQ==:Hello Cipher Update",
+				evaluate(compiled, "ranged", "()Ljava/lang/String;", null, List.of()));
+		assertStringValue("WXYAnhr5S0er6HFlfx3V2IINiQ==:Hello Cipher Update",
+				evaluate(compiled, "rangedFinal", "()Ljava/lang/String;", null, List.of()));
+		assertStringValue("WXYAnhr5S0er6HFlfx3V2IINiQ==:Hello Cipher Update",
+				evaluate(compiled, "whole", "()Ljava/lang/String;", null, List.of()));
+	}
+
+	@Test
+	void testCipherByteStreams() {
+		// Compile byte-array stream encryption and decryption without touching the filesystem.
+		String compiled = compile("""
+						static String run() throws Exception {
+						    byte[] key = "0123456789abcdef".getBytes();
+						    byte[] iv = "1234567890123456".getBytes();
+						    SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+						    IvParameterSpec ivSpec = new IvParameterSpec(iv);
+						    Cipher encrypt = Cipher.getInstance("AES/CBC/PKCS5Padding");
+						    encrypt.init(1, keySpec, ivSpec);
+						    ByteArrayOutputStream encrypted = new ByteArrayOutputStream();
+						    CipherOutputStream output = new CipherOutputStream(encrypted, encrypt);
+						    byte[] first = "Hello ".getBytes();
+						    byte[] second = "Cipher Streams".getBytes();
+						    output.write(first);
+						    output.write(second, 0, second.length);
+						    output.flush();
+						    output.close();
+						    Cipher decrypt = Cipher.getInstance("AES/CBC/PKCS5Padding");
+						    decrypt.init(2, keySpec, ivSpec);
+						    ByteArrayInputStream source = new ByteArrayInputStream(encrypted.toByteArray());
+						    CipherInputStream input = new CipherInputStream(source, decrypt);
+						    byte[] plaintext = input.readAllBytes();
+						    input.close();
+						    return Base64.getEncoder().encodeToString(encrypted.toByteArray()) + ":" + new String(plaintext);
+						}
+						""", ByteArrayInputStream.class, ByteArrayOutputStream.class, Cipher.class,
+				CipherInputStream.class, CipherOutputStream.class, IvParameterSpec.class,
+				SecretKeySpec.class, Base64.class);
+
+		// The stream wrappers must preserve the exact ciphertext and recover the original text.
+		assertStringValue("i0KcjvhYv1+icl4ESawRfLgrZLOzWp0ShXKD0KHmBww=:Hello Cipher Streams",
+				evaluate(compiled, "run", "()Ljava/lang/String;", null, List.of()));
 	}
 
 	@Test
@@ -1600,6 +2066,18 @@ public class EvaluatorTest extends TransformerTestBase {
 	}
 
 	@Test
+	void testKnownStringInstanceOfFoldsExactly() {
+		String compiled = compile("""
+				static int run() {
+				    Object value = "known";
+				    return (value instanceof String ? 1 : 0)
+				            + (value instanceof Integer ? 10 : 0);
+				}
+				""");
+		assertIntValue(1, evaluate(compiled, "run", "()I", null, List.of()));
+	}
+
+	@Test
 	void testUnknownBranchBails() {
 		String compiled = compile("""
 				static int unary(int input) {
@@ -1683,6 +2161,85 @@ public class EvaluatorTest extends TransformerTestBase {
 		EvaluationResult result = evaluateResult(compiled, "run", "()I", null, List.of(), true, get("StaticState"));
 		EvaluationYieldResult yielded = assertInstanceOf(EvaluationYieldResult.class, result);
 		assertIntValue(1, yielded.value());
+	}
+
+	@Test
+	void testOverrideNodeForStaticInitializerEval() {
+		// Add the common state class to the workspace.
+		compileStaticState();
+
+		// Get the class as a node, then get its static initializer.
+		JvmClassInfo classInfo = get("StaticState");
+		ClassNode classNode = new ClassNode();
+		classInfo.getClassReader().accept(classNode, ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+		MethodNode initializer = classNode.methods.stream()
+				.filter(method -> "<clinit>".equals(method.name) && "()V".equals(method.desc))
+				.findFirst()
+				.orElseThrow();
+
+		// Replace the constant value in the initializer with a different value to validate that the evaluator uses the supplied node.
+		for (AbstractInsnNode instruction : initializer.instructions.toArray())
+			if (instruction.getOpcode() == Opcodes.ICONST_1)
+				initializer.instructions.set(instruction, new InsnNode(Opcodes.ICONST_2));
+
+		Workspace evaluationWorkspace = TestClassUtils.fromBundle(TestClassUtils.fromClasses(classInfo));
+		JvmTransformerContext context = new JvmTransformerContext(evaluationWorkspace, evaluationWorkspace.getPrimaryResource(), Collections.emptyList());
+		FieldCacheManager fieldCacheManager = new FieldCacheManager();
+		Evaluator evaluator = new Evaluator(evaluationWorkspace, context.newInterpreter(new InheritanceGraph(evaluationWorkspace)), fieldCacheManager, 1000, false, true);
+
+		// Evaluate the class initializer using the modified node. The static field value should be 2 instead of 1.
+		// The special case evaluate call for static initializers also yields UNINITIALIZED_VALUE for successful evaluation, since the initializer doesn't normally return a value.
+		EvaluationYieldResult yielded = assertInstanceOf(EvaluationYieldResult.class, evaluator.evaluateClassInitializer(classNode));
+		assertSame(UninitializedValue.UNINITIALIZED_VALUE, yielded.value());
+
+		// The static field cache should now contain the updated value of 2 for the static field rather than the original 1.
+		FieldCache fields = fieldCacheManager.getStaticFieldCache("StaticState");
+		assertIntValue(2, fields.getField("StaticState", "VALUE", "I"));
+	}
+
+	@Test
+	void testOverrideNodeAllowsEvalOfClassNotInTheWorkspace() {
+		// Create a workspace with the common 'Example' class.
+		compile("static int host() { return 0; }");
+		JvmClassInfo classInfo = get(CLASS_NAME);
+		Workspace evaluationWorkspace = TestClassUtils.fromBundle(TestClassUtils.fromClasses(classInfo));
+
+		// Setup evaluator.
+		JvmTransformerContext context = new JvmTransformerContext(evaluationWorkspace,
+				evaluationWorkspace.getPrimaryResource(), Collections.emptyList());
+		Evaluator evaluator = new Evaluator(evaluationWorkspace,
+				context.newInterpreter(new InheritanceGraph(evaluationWorkspace)),
+				new FieldCacheManager(), 1000, false, false);
+
+		// Build a class that can only be reached through the evaluator's override map.
+		String syntheticName = "synthetic/Generated";
+		ClassNode synthetic = new ClassNode();
+		synthetic.version = Opcodes.V17;
+		synthetic.access = Opcodes.ACC_PUBLIC;
+		synthetic.name = syntheticName;
+		synthetic.superName = "java/lang/Object";
+
+		MethodNode helper = new MethodNode(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC, "helper", "()I", null, null);
+		helper.instructions.add(new InsnNode(Opcodes.ICONST_2));
+		helper.instructions.add(new InsnNode(Opcodes.IRETURN));
+		helper.maxStack = 1;
+		helper.maxLocals = 0;
+		synthetic.methods.add(helper);
+
+		MethodNode run = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "run", "()I", null, null);
+		run.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, syntheticName, "helper", "()I", false));
+		run.instructions.add(new InsnNode(Opcodes.IRETURN));
+		run.maxStack = 1;
+		run.maxLocals = 0;
+		synthetic.methods.add(run);
+
+		// Register the override.
+		evaluator.registerClassNodeOverride(synthetic);
+
+		// The evaluator should be able to evaluate the synthetic class even though it is not in the workspace.
+		assertTrue(evaluator.canEvaluate(syntheticName, "run", "()I"));
+		EvaluationYieldResult yielded = assertInstanceOf(EvaluationYieldResult.class, evaluator.evaluate(syntheticName, "run", "()I", null, List.of()));
+		assertIntValue(2, yielded.value());
 	}
 
 	@Test

@@ -1,4 +1,4 @@
-package software.coley.recaf.services.deobfuscation.transform.specific;
+package software.coley.recaf.services.deobfuscation.transform.specific.dasho;
 
 import jakarta.annotation.Nonnull;
 import jakarta.enterprise.context.Dependent;
@@ -24,12 +24,18 @@ import static org.objectweb.asm.Opcodes.ICONST_5;
 import static org.objectweb.asm.Opcodes.IRETURN;
 
 /**
- * A transformer that folds opaque number providers in DashO obfuscated samples.
+ * A transformer that replaces DashO decryption seed value functions with a constant value.
+ * <p>
+ * In practice the values are always positive, so we can just return a positive constant.
+ * This solves the issue of the unseeded use of {@code Random} being non-deterministic
+ * making it impossible for transformers to reliably decrypt strings and other obfuscated values.
  *
  * @author Matt Coley
  */
 @Dependent
 public class DashOpaqueSeedFoldingTransformer implements JvmClassTransformer, CollectionTransformer {
+	public static final String IDENTIFIER = "specific.dasho.opaqueseed";
+
 	@Override
 	public void transform(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace,
 	                      @Nonnull WorkspaceResource resource, @Nonnull JvmClassBundle bundle,
@@ -92,7 +98,7 @@ public class DashOpaqueSeedFoldingTransformer implements JvmClassTransformer, Co
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "DashO Opaque Seed Folding";
+	public String identifier() {
+		return IDENTIFIER;
 	}
 }

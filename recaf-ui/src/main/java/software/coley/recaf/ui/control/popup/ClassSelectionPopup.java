@@ -90,6 +90,7 @@ public class ClassSelectionPopup extends RecafStage {
 		acceptButton.disableProperty().bind(disable);
 		HBox buttons = new HBox(acceptButton, new Spacer(), cancelButton);
 		VBox layout = new VBox(tree, buttons);
+		// TODO: Add a search box/filter since manual traversal can be a pain in obfuscated workspaces.
 		layout.setSpacing(10);
 		layout.setAlignment(Pos.TOP_CENTER);
 		layout.setPadding(new Insets(10));

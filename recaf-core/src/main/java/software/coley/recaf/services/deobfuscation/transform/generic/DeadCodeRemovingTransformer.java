@@ -40,6 +40,8 @@ import static software.coley.recaf.util.AsmInsnUtil.fixMissingVariableLabels;
  */
 @Dependent
 public class DeadCodeRemovingTransformer implements JvmClassTransformer {
+	public static final String IDENTIFIER = "cleanup.deadcode";
+
 	@Override
 	public void transform(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace,
 	                      @Nonnull WorkspaceResource resource, @Nonnull JvmClassBundle bundle,
@@ -185,8 +187,8 @@ public class DeadCodeRemovingTransformer implements JvmClassTransformer {
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Dead code removal";
+	public String identifier() {
+		return IDENTIFIER;
 	}
 
 	record TryCatch(@Nonnull TryCatchBlockNode block, @Nonnull List<AbstractInsnNode> visitedInstructions) {

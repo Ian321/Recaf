@@ -191,7 +191,8 @@ public class AsmInsnUtil implements Opcodes {
 			case Type.FLOAT -> new VarInsnNode(FLOAD, index);
 			case Type.DOUBLE -> new VarInsnNode(DLOAD, index);
 			case Type.LONG -> new VarInsnNode(LLOAD, index);
-			default -> new VarInsnNode(ALOAD, index);
+			case Type.ARRAY, Type.OBJECT -> new VarInsnNode(ALOAD, index);
+			default -> throw new IllegalArgumentException("Unsupported variable type sort: " + typeSort);
 		};
 	}
 
@@ -205,13 +206,66 @@ public class AsmInsnUtil implements Opcodes {
 	 */
 	@Nonnull
 	public static VarInsnNode createVarStore(int index, @Nonnull Type variableType) {
-		return switch (variableType.getSort()) {
+		return createVarStore(index, variableType.getSort());
+	}
+
+	/**
+	 * @param index
+	 * 		Variable index.
+	 * @param typeSort
+	 * 		Variable type sort.
+	 *
+	 * @return Store instruction for variable type at the given index.
+	 */
+	public static VarInsnNode createVarStore(int index, int typeSort) {
+		return switch (typeSort) {
 			case Type.BOOLEAN, Type.CHAR, Type.BYTE, Type.SHORT, Type.INT -> new VarInsnNode(ISTORE, index);
 			case Type.FLOAT -> new VarInsnNode(FSTORE, index);
 			case Type.DOUBLE -> new VarInsnNode(DSTORE, index);
 			case Type.LONG -> new VarInsnNode(LSTORE, index);
-			default -> new VarInsnNode(ASTORE, index);
+			case Type.ARRAY, Type.OBJECT -> new VarInsnNode(ASTORE, index);
+			default -> throw new IllegalArgumentException("Unsupported variable type sort: " + typeSort);
 		};
+	}
+
+	/**
+	 * @param opcode
+	 * 		Instruction opcode.
+	 *
+	 * @return {@code true} when the opcode loads one array element.
+	 */
+	public static boolean isArrayLoad(int opcode) {
+		return switch (opcode) {
+			case IALOAD, LALOAD, FALOAD, DALOAD,
+			     AALOAD, BALOAD, CALOAD, SALOAD -> true;
+			default -> false;
+		};
+	}
+
+	/**
+	 * @param opcode
+	 * 		Instruction opcode.
+	 *
+	 * @return {@code true} when the opcode stores one array element.
+	 */
+	public static boolean isArrayStore(int opcode) {
+		return switch (opcode) {
+			case IASTORE, LASTORE, FASTORE, DASTORE,
+			     AASTORE, BASTORE, CASTORE, SASTORE -> true;
+			default -> false;
+		};
+	}
+
+	/**
+	 * @param instruction
+	 * 		Instruction to check.
+	 *
+	 * @return {@code true} when the instruction pushes a two-slot long value.
+	 */
+	public static boolean isWideConstant(@Nonnull AbstractInsnNode instruction) {
+		return instruction.getOpcode() == Opcodes.LCONST_0
+				|| instruction.getOpcode() == Opcodes.LCONST_1
+				|| instruction instanceof LdcInsnNode ldc && ldc.cst instanceof Long;
 	}
 
 	/**
@@ -680,8 +734,15 @@ public class AsmInsnUtil implements Opcodes {
 		int op = insn.getOpcode();
 		if (op == ATHROW) // Obvious case
 			return true;
-		if (insn instanceof MethodInsnNode) // Method calls can throw.
+		if (insn instanceof MethodInsnNode || insn instanceof InvokeDynamicInsnNode) // Calls can throw.
 			return true;
+
+		// Type resolution and allocation instructions can throw before their normal result is available.
+		//  - NEW triggering class resolution, <clinit> fails, etc.
+		if (op == NEW || op == ANEWARRAY || op == NEWARRAY || op == MULTIANEWARRAY ||
+				op == CHECKCAST || op == INSTANCEOF)
+			return true;
+
 		// NullPointerException
 		return op == GETFIELD || op == PUTFIELD || op == ARRAYLENGTH ||
 				// NullPointerException, ArrayIndexOutOfBoundsException

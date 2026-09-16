@@ -202,11 +202,45 @@ public class Types {
 	 * @return Number of variable slots occupied by the parameters.
 	 */
 	public static int countParameterSlots(@Nonnull Type methodType) {
-		int size = 0;
 		Type[] methodArgs = methodType.getArgumentTypes();
-		for (Type arg : methodArgs)
+		return countParameterSlots(methodArgs);
+	}
+
+	/**
+	 * @param argumentTypes
+	 * 		Parsed method argument types.
+	 *
+	 * @return Number of variable slots occupied by the parameters.
+	 */
+	public static int countParameterSlots(@Nonnull Type[] argumentTypes) {
+		int size = 0;
+		for (Type arg : argumentTypes)
 			size += arg.getSize();
 		return size;
+	}
+
+	/**
+	 * @param isStatic
+	 * 		Whether the method is static.
+	 * @param methodType
+	 * 		Parsed method descriptor type.
+	 *
+	 * @return Number of variable slots occupied by the parameters, including {@code this} if non-static.
+	 */
+	public static int parameterEndSlot(boolean isStatic, @Nonnull Type methodType) {
+		return parameterEndSlot(isStatic, methodType.getArgumentTypes());
+	}
+
+	/**
+	 * @param isStatic
+	 * 		Whether the method is static.
+	 * @param argumentTypes
+	 * 		Parsed method argument types.
+	 *
+	 * @return Number of variable slots occupied by the parameters, including {@code this} if non-static.
+	 */
+	public static int parameterEndSlot(boolean isStatic, @Nonnull Type[] argumentTypes) {
+		return countParameterSlots(argumentTypes) + (isStatic ? 0 : 1);
 	}
 
 	/**
@@ -258,6 +292,17 @@ public class Types {
 	public static boolean isWide(@Nullable Type type) {
 		if (type == null) return false;
 		return Type.DOUBLE_TYPE.equals(type) || Type.LONG_TYPE.equals(type);
+	}
+
+	/**
+	 * @param desc
+	 * 		Descriptor to check.
+	 *
+	 * @return {@code true} if it is a wide type.
+	 */
+	public static boolean isWide(@Nullable String desc) {
+		if (desc == null) return false;
+		return "D".equals(desc) || "J".equals(desc);
 	}
 
 	/**
@@ -352,7 +397,7 @@ public class Types {
 	public static int getNormalizedSort(int sort) {
 		if (sort == Type.ARRAY)
 			sort = Type.OBJECT;
-		else if (sort > 0 && sort < Type.INT)
+		else if (sort > Type.VOID && sort < Type.INT)
 			sort = Type.INT;
 		return sort;
 	}
@@ -535,6 +580,75 @@ public class Types {
 		} catch (Throwable t) {
 			return false;
 		}
+	}
+
+	/**
+	 * @param arrayType
+	 * 		The array type to check.
+	 * @param valueType
+	 * 		The value type to check for storing into the array.
+	 * @param recursive
+	 * 		Whether to check for nested arrays if the array type is multi-dimensional.
+	 *
+	 * @return {@code true} if the value type can be stored in the array type, {@code false} otherwise.
+	 */
+	public static boolean isArrayStorable(@Nonnull Type arrayType, @Nonnull Type valueType, boolean recursive) {
+		if (arrayType.getSort() != Type.ARRAY)
+			return false;
+
+		Type componentType = Type.getType(arrayType.getDescriptor().substring(1));
+		if (isArrayStoreCompatible(componentType, valueType))
+			return true;
+
+		if (recursive && componentType.getSort() == Type.ARRAY)
+			return isArrayStorable(componentType, valueType, true);
+
+		return false;
+	}
+
+	/**
+	 * @param arrayComponent
+	 * 		The component type of the array.
+	 * @param value
+	 * 		The value type to check for storing into the array.
+	 *
+	 * @return {@code true} if the value type can be stored in the array component type, {@code false} otherwise.
+	 */
+	public static boolean isArrayStoreCompatible(@Nonnull Type arrayComponent, @Nonnull Type value) {
+		if (arrayComponent.equals(value))
+			return true;
+
+		// Primitive widening rules allow narrower types to be stored in wider types.
+		int aSort = arrayComponent.getSort();
+		int vSort = value.getSort();
+		if (aSort >= Type.BOOLEAN && aSort <= Type.DOUBLE && vSort >= Type.BOOLEAN && vSort <= Type.DOUBLE) {
+			if (aSort == Type.BOOLEAN || vSort == Type.BOOLEAN)
+				return false;
+			return switch (aSort) {
+				case Type.DOUBLE -> true;
+				case Type.FLOAT -> vSort != Type.DOUBLE;
+				case Type.LONG -> vSort <= Type.LONG && vSort != Type.FLOAT;
+				case Type.INT -> vSort == Type.BYTE || vSort == Type.SHORT || vSort == Type.CHAR || vSort == Type.INT;
+				case Type.SHORT -> vSort == Type.BYTE || vSort == Type.SHORT;
+				case Type.CHAR, Type.BYTE -> false;
+				default -> false;
+			};
+		}
+
+		// Object/array types can be stored in each other if they are compatible.
+		// We don't do any sort of special 'isAssignableFrom' checks here, just a simple check for object/array types.
+		if (aSort == Type.OBJECT || aSort == Type.ARRAY) {
+			if (aSort == Type.OBJECT && "java/lang/Object".equals(arrayComponent.getInternalName()))
+				return vSort == Type.OBJECT || vSort == Type.ARRAY;
+
+			if (aSort == Type.ARRAY && vSort == Type.ARRAY) {
+				Type tComp = Type.getType(arrayComponent.getDescriptor().substring(1));
+				Type sComp = Type.getType(value.getDescriptor().substring(1));
+				return isArrayStoreCompatible(tComp, sComp);
+			}
+		}
+
+		return false;
 	}
 
 	/**

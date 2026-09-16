@@ -5,6 +5,8 @@ import jakarta.annotation.Nullable;
 import jakarta.enterprise.context.Dependent;
 import jakarta.inject.Inject;
 import me.darknet.assembler.printer.JvmPrinterUtil;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.IincInsnNode;
@@ -14,6 +16,7 @@ import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 import org.objectweb.asm.tree.analysis.Frame;
 import software.coley.collections.Lists;
@@ -33,6 +36,7 @@ import software.coley.recaf.util.analysis.value.DoubleValue;
 import software.coley.recaf.util.analysis.value.FloatValue;
 import software.coley.recaf.util.analysis.value.IntValue;
 import software.coley.recaf.util.analysis.value.LongValue;
+import software.coley.recaf.util.analysis.value.ObjectValue;
 import software.coley.recaf.util.analysis.value.ReValue;
 import software.coley.recaf.util.analysis.value.StringValue;
 import software.coley.recaf.workspace.model.Workspace;
@@ -59,10 +63,13 @@ import static software.coley.recaf.util.AsmInsnUtil.*;
  */
 @Dependent
 public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
+	/** Stable translation key for this transformer. */
+	public static final String IDENTIFIER = "peephole.data.constfold";
 	private static final int[] ARG_1_SIZE = new int[255];
 	private static final int[] ARG_2_SIZE = new int[255];
 	private final InheritanceGraphService graphService;
 	private InheritanceGraph inheritanceGraph;
+	private JvmTransformerContext context;
 
 	@Inject
 	public OpaqueConstantFoldingTransformer(@Nonnull InheritanceGraphService graphService) {
@@ -71,6 +78,8 @@ public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
 
 	@Override
 	public void setup(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace) {
+		this.context = context;
+
 		inheritanceGraph = graphService.getOrCreateInheritanceGraph(workspace);
 	}
 
@@ -111,8 +120,10 @@ public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
 				throw new TransformationException("Error encountered when folding constants", t);
 			}
 		}
-		if (dirty)
+		if (dirty) {
+			context.setRecomputeFrames(className);
 			context.setNode(bundle, initialClassState, node);
+		}
 	}
 
 	/**
@@ -131,14 +142,18 @@ public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
 	 *
 	 * @return {@code true} when any stack operation was transformed.
 	 *
-	 * @throws TransformationException
-	 * 		When the method code couldn't be analyzed.
 	 */
 	private boolean pass1StackManipulation(@Nonnull JvmTransformerContext context, @Nonnull ClassNode node,
-	                                       @Nonnull MethodNode method, @Nonnull InsnList instructions) throws TransformationException {
+	                                       @Nonnull MethodNode method, @Nonnull InsnList instructions) {
 		boolean dirty = false;
 		int insertions = 0;
-		Frame<ReValue>[] frames = context.analyze(inheritanceGraph, node, method);
+		Frame<ReValue>[] frames;
+		try {
+			frames = context.analyze(inheritanceGraph, node, method);
+		} catch (Throwable t) {
+			// Can't analyze the method, so we can't do any stack manipulation.
+			return false;
+		}
 		for (int i = 1; i < instructions.size() - 1; i++) {
 			Frame<ReValue> frame = frames[i - insertions];
 			if (frame == null || frame.getStackSize() == 0)
@@ -329,19 +344,32 @@ public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
 	 *
 	 * @return {@code true} when any stack operation was transformed.
 	 *
-	 * @throws TransformationException
-	 * 		When the method code couldn't be analyzed.
 	 */
 	private boolean pass2SequenceFolding(@Nonnull JvmTransformerContext context, @Nonnull ClassNode node,
-	                                     @Nonnull MethodNode method, @Nonnull InsnList instructions) throws TransformationException {
+	                                     @Nonnull MethodNode method, @Nonnull InsnList instructions) {
 		boolean dirty = false;
 		List<AbstractInsnNode> sequence = new ArrayList<>();
-		Frame<ReValue>[] frames = context.analyze(inheritanceGraph, node, method);
+		Frame<ReValue>[] frames;
+		try {
+			frames = context.analyze(inheritanceGraph, node, method);
+		} catch (Throwable t) {
+			// Can't analyze the method, so we can't do any stack manipulation.
+			return false;
+		}
 		int endIndex = instructions.size() - 1;
 		int unknownState = -1;
 		for (int i = 1; i < endIndex; i++) {
 			AbstractInsnNode instruction = instructions.get(i);
 			int opcode = instruction.getOpcode();
+
+			// Casting preserves the stack size, so it is skipped by the sequence walker below.
+			// Handle known-safe casts separately before looking for value-consuming operations.
+			if (opcode == CHECKCAST) {
+				Frame<ReValue> frame = frames[i];
+				if (frame != null && foldRedundantCheckcast(instructions, instruction, frame))
+					dirty = true;
+				continue;
+			}
 
 			// Iterate until we find an instruction that consumes values off the stack as part of an "operation".
 			int sizeConsumed = getSizeConsumed(instruction);
@@ -360,6 +388,26 @@ public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
 			Frame<ReValue> nextFrame = frames[i + 1];
 			if ((nextFrame == null || nextFrame.getStackSize() <= 0) && !isReturn)
 				continue;
+
+			// Repeated unknown operations cannot become known by expanding the same straight-line chain.
+			ReValue resultValue = isReturn ?
+					frame.getStack(frame.getStackSize() - 1) :
+					nextFrame.getStack(nextFrame.getStackSize() - 1);
+			AbstractInsnNode nextInstruction = instruction.getNext();
+			boolean repeatedUnknownOperation = !resultValue.hasKnownValue()
+					&& !isReturn
+					&& !isLabel(nextInstruction)
+					&& nextInstruction != null
+					&& nextInstruction.getOpcode() == opcode;
+			if (repeatedUnknownOperation) {
+				// If we have a repeated unknown operation, see if it is a redundant operation.
+				// Aside from that, we cannot do anything with it since we don't know the result of the operation.
+				if (foldRedundantOperations(instructions, instruction, frame))
+					dirty = true;
+				else
+					unknownState = i;
+				continue;
+			}
 
 			// Walk backwards from this point and try and find a sequence of instructions that
 			// will create the expected stack state we see for this operation instruction.
@@ -579,6 +627,41 @@ public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
 	}
 
 	/**
+	 * Removes a checkcast when the analyzed value already has a known assignable runtime type.
+	 *
+	 * @param instructions
+	 * 		Instructions to operate on.
+	 * @param instruction
+	 * 		The checkcast instruction to inspect.
+	 * @param frame
+	 * 		The stack frame before the instruction.
+	 *
+	 * @return {@code true} when the checkcast was redundant and replaced with a nop.
+	 */
+	private boolean foldRedundantCheckcast(@Nonnull InsnList instructions,
+	                                       @Nonnull AbstractInsnNode instruction,
+	                                       @Nonnull Frame<ReValue> frame) {
+		// Skip if this isn't a checkcast instruction or the stack is empty.
+		if (!(instruction instanceof TypeInsnNode cast) || frame.getStackSize() == 0)
+			return false;
+
+		// A known object value has an exact runtime type, so an assignable cast cannot throw or refine the verifier type.
+		ReValue value = frame.getStack(frame.getStackSize() - 1);
+		if (!(value instanceof ObjectValue object) || !object.hasKnownValue())
+			return false;
+
+		// If the value's runtime type is assignable to the cast type, then the checkcast is redundant.
+		Type valueType = object.type();
+		String descriptor = cast.desc;
+		Type targetType = descriptor.startsWith("[") ? Type.getType(descriptor) : Type.getObjectType(descriptor);
+		if (!context.isAssignable(inheritanceGraph, targetType, valueType))
+			return false;
+
+		instructions.set(instruction, new InsnNode(NOP));
+		return true;
+	}
+
+	/**
 	 * @param instructions
 	 * 		Instructions to operate on.
 	 * @param instruction
@@ -735,8 +818,8 @@ public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Opaque constant folding";
+	public String identifier() {
+		return IDENTIFIER;
 	}
 
 	@Nonnull
@@ -788,7 +871,14 @@ public class OpaqueConstantFoldingTransformer implements JvmClassTransformer {
 	 */
 	@Nullable
 	@SuppressWarnings("OptionalGetWithoutIsPresent")
-	public static AbstractInsnNode toInsn(@Nonnull ReValue value) {
+	public static AbstractInsnNode toInsn(@Nullable ReValue value) {
+		if (value == null)
+			return null;
+
+		// Check for null. Not covered by 'known value' so we need to handle it explicitly.
+		if (value == ObjectValue.VAL_OBJECT_NULL || value instanceof ObjectValue objectValue && objectValue.isNull())
+			return new InsnNode(Opcodes.ACONST_NULL);
+
 		// Skip if value is not known.
 		if (!value.hasKnownValue())
 			return null;

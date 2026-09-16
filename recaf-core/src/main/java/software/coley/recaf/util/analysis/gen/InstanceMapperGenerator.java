@@ -81,7 +81,7 @@ public class InstanceMapperGenerator extends GenUtils {
 
 	@Nonnull
 	private static String buildParameterList(@Nonnull Class<?>[] parameterTypes) {
-		//  new String(   arrc((ArrayValue) parameters.get(0))    );
+		//  new String(   arrc(parameters.get(0))    );
 		List<String> entries = new ArrayList<>(parameterTypes.length);
 		for (int i = 0; i < parameterTypes.length; i++) {
 			String parameter = "parameters.get(" + i + ")";

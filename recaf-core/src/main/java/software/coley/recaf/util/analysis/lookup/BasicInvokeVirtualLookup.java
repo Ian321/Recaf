@@ -6,6 +6,7 @@ import org.objectweb.asm.tree.MethodInsnNode;
 import software.coley.recaf.analytics.logging.DebuggingLogger;
 import software.coley.recaf.analytics.logging.Logging;
 import software.coley.recaf.util.analysis.Nullness;
+import software.coley.recaf.util.analysis.eval.InstancedObjectValue;
 import software.coley.recaf.util.analysis.gen.LookupGenerator;
 import software.coley.recaf.util.analysis.value.ArrayValue;
 import software.coley.recaf.util.analysis.value.IllegalValueException;
@@ -15,6 +16,7 @@ import software.coley.recaf.util.analysis.value.ReValue;
 import software.coley.recaf.util.analysis.value.StringValue;
 
 import java.io.UnsupportedEncodingException;
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -218,6 +220,11 @@ public class BasicInvokeVirtualLookup extends BasicLookupUtils implements Invoke
 			} catch (UnsupportedEncodingException e) {
 				return ArrayValue.VAL_BYTES;
 			}
+		});
+		METHODS.put("java/lang/String.getBytes(Ljava/nio/charset/Charset;)[B", (Func_2<StringValue, ObjectValue>) (ctx, a) -> {
+			if (!(a instanceof InstancedObjectValue<?> instanced) || !(instanced.getRealInstance() instanceof Charset charset))
+				throw new IllegalArgumentException();
+			return arrb(str(ctx).getBytes(charset));
 		});
 		METHODS.put("java/lang/String.contentEquals(Ljava/lang/CharSequence;)Z", (Func_2<StringValue, StringValue>) (ctx, a) -> z(str(ctx).contentEquals(str(a))));
 		METHODS.put("java/lang/String.regionMatches(ZILjava/lang/String;II)Z", (Func_6<StringValue, IntValue, IntValue, StringValue, IntValue, IntValue>) (ctx, a, b, c, d, e) -> z(str(ctx).regionMatches(z(a), i(b), str(c), i(d), i(e))));

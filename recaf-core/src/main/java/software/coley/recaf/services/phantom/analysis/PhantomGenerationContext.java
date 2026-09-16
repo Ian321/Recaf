@@ -7,8 +7,8 @@ import software.coley.recaf.info.JvmClassInfo;
 import software.coley.recaf.services.phantom.model.PhantomClassConstraint;
 import software.coley.recaf.workspace.model.Workspace;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * Shared state for phantom generation analysis passes.
@@ -17,7 +17,7 @@ import java.util.Map;
  */
 public class PhantomGenerationContext {
 	private final ClassLookup lookup;
-	private final Map<String, PhantomClassConstraint> constraints = new HashMap<>();
+	private final Map<String, PhantomClassConstraint> constraints = new TreeMap<>();
 	private final boolean lenientConflictingHierarchies;
 
 	/**
@@ -27,12 +27,15 @@ public class PhantomGenerationContext {
 	 * 		Classes being analyzed.
 	 * @param lenientConflictingHierarchies
 	 * 		Whether incompatible class supertype candidates should be chained leniently.
+	 * @param targetVersion
+	 * 		Java version whose multi-release classes should be selected.
 	 */
 	public PhantomGenerationContext(@Nonnull Workspace workspace,
 	                                @Nonnull Map<String, JvmClassInfo> inputClasses,
-	                                boolean lenientConflictingHierarchies) {
+	                                boolean lenientConflictingHierarchies,
+	                                int targetVersion) {
 		this.lenientConflictingHierarchies = lenientConflictingHierarchies;
-		lookup = new ClassLookup(workspace, inputClasses, constraints);
+		lookup = new ClassLookup(workspace, inputClasses, constraints, targetVersion);
 	}
 
 	/**
@@ -73,7 +76,7 @@ public class PhantomGenerationContext {
 	 * @param internalName
 	 * 		Internal class name.
 	 *
-	 * @return {@code true} when the type is already known from the inputs or workspace.
+	 * @return {@code true} when the type is already known from the inputs, workspace, or runtime classes.
 	 */
 	public boolean isKnown(@Nullable String internalName) {
 		return lookup.isKnown(internalName);

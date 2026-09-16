@@ -1,12 +1,14 @@
 package software.coley.recaf.services.deobfuscation.transform.generic;
 
 import jakarta.annotation.Nonnull;
+import jakarta.annotation.Nullable;
 import jakarta.enterprise.context.Dependent;
 import jakarta.inject.Inject;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
@@ -19,11 +21,15 @@ import software.coley.recaf.services.transform.ClassTransformer;
 import software.coley.recaf.services.transform.JvmClassTransformer;
 import software.coley.recaf.services.transform.JvmTransformerContext;
 import software.coley.recaf.services.transform.TransformationException;
+import software.coley.recaf.services.transform.TransformationParameter;
 import software.coley.recaf.util.ClassMethodPair;
+import software.coley.recaf.util.analysis.ReAnalyzer;
+import software.coley.recaf.util.analysis.ReInterpreter;
 import software.coley.recaf.util.analysis.eval.EvaluationResult;
 import software.coley.recaf.util.analysis.eval.EvaluationYieldResult;
 import software.coley.recaf.util.analysis.eval.Evaluator;
 import software.coley.recaf.util.analysis.eval.FieldCacheManager;
+import software.coley.recaf.util.analysis.lookup.GetStaticLookup;
 import software.coley.recaf.util.analysis.value.DoubleValue;
 import software.coley.recaf.util.analysis.value.LongValue;
 import software.coley.recaf.util.analysis.value.ReValue;
@@ -43,9 +49,16 @@ import java.util.Set;
  */
 @Dependent
 public class CallResultInliningTransformer implements JvmClassTransformer {
-	/** Key for the maximum number of steps to allow when evaluating a method. */
-	public static final String KEY_MAX_STEPS = "call-result-inlining.max-steps";
+	public static final String IDENTIFIER = "peephole.data.callinline";
+	public static final String KEY_MAX_STEPS = IDENTIFIER + ".max-steps";
+	public static final String KEY_EVALUATE_CLASS_INITIALIZERS = IDENTIFIER + ".evaluate-class-initializers";
+
 	private static final int DEFAULT_MAX_STEPS = 20_000;
+	private static final boolean DEFAULT_EVALUATE_CLASS_INITIALIZERS = false;
+	private static final TransformationParameter<Integer> MAX_STEPS_PARAMETER =
+			new TransformationParameter<>(KEY_MAX_STEPS, int.class, DEFAULT_MAX_STEPS);
+	private static final TransformationParameter<Boolean> EVALUATE_CLASS_INITIALIZERS_PARAMETER =
+			new TransformationParameter<>(KEY_EVALUATE_CLASS_INITIALIZERS, boolean.class, DEFAULT_EVALUATE_CLASS_INITIALIZERS);
 
 	private final InheritanceGraphService graphService;
 
@@ -68,21 +81,37 @@ public class CallResultInliningTransformer implements JvmClassTransformer {
 		boolean dirty = false;
 		String className = initialClassState.getName();
 		ClassNode node = context.getNode(bundle, initialClassState);
+		StaticValueCollectionTransformer staticValueCollector = context.getOptionalTransformer(StaticValueCollectionTransformer.class);
 
 		// The transformer instance is shared across classes transformed in parallel, so the evaluator
 		// and its field cache must be scoped to this invocation rather than stored as instance state.
 		// We used to have a shared evaluator + cache, but that caused issues with the parallel evaluation
 		// of multiple classes, where the field cache would be polluted by other threads.
 		int maxSteps = context.getParameters().getInt(KEY_MAX_STEPS, DEFAULT_MAX_STEPS);
+		boolean evaluateClassInitializers = context.getParameters().getBoolean(KEY_EVALUATE_CLASS_INITIALIZERS, DEFAULT_EVALUATE_CLASS_INITIALIZERS);
 		FieldCacheManager fieldCacheManager = new FieldCacheManager();
-		Evaluator evaluator = new Evaluator(workspace, context.newInterpreter(inheritanceGraph), fieldCacheManager, maxSteps, false, false);
+
+		// If we have the static value collection transformer active we want to pull values from it when evaluating static fields.
+		// So we'll create a lookup wrapper that bundles both the static value collection and the default lookup together.
+		ReInterpreter evaluatorInterpreter = context.newInterpreter(inheritanceGraph);
+		installStaticValueCollector(evaluatorInterpreter, staticValueCollector);
+
+		Evaluator evaluator = new Evaluator(workspace, evaluatorInterpreter, fieldCacheManager, maxSteps, false, evaluateClassInitializers);
 		for (MethodNode method : node.methods) {
 			// Skip if abstract.
 			InsnList instructions = method.instructions;
 			if (instructions == null)
 				continue;
 
-			Frame<ReValue>[] frames = context.analyze(inheritanceGraph, node, method);
+			Frame<ReValue>[] frames;
+			try {
+				ReAnalyzer analyzer = context.newAnalyzer(inheritanceGraph, node, method);
+				installStaticValueCollector(analyzer.getInterpreter(), staticValueCollector);
+				frames = analyzer.analyze(node.name, method);
+			} catch (Throwable ex) {
+				// Analysis failed, skip this method.
+				continue;
+			}
 			for (int i = instructions.size() - 1; i >= 0; i--) {
 				AbstractInsnNode insn = instructions.get(i);
 				if (insn.getOpcode() == Opcodes.INVOKESTATIC && insn instanceof MethodInsnNode min) {
@@ -136,6 +165,34 @@ public class CallResultInliningTransformer implements JvmClassTransformer {
 			context.setNode(bundle, initialClassState, node);
 	}
 
+	private static void installStaticValueCollector(@Nonnull ReInterpreter interpreter,
+	                                                @Nullable StaticValueCollectionTransformer collector) {
+		// Static value collector transformer isn't active.
+		if (collector == null)
+			return;
+
+		// If the interpreter has no existing lookup, we can just set the collector as the lookup.
+		GetStaticLookup fallback = interpreter.getGetStaticLookup();
+		if (fallback == null) {
+			interpreter.setGetStaticLookup(collector);
+			return;
+		}
+
+		// Combine both the collector and the existing lookup so the evaluator can benefit from both.
+		interpreter.setGetStaticLookup(new GetStaticLookup() {
+			@Nonnull
+			@Override
+			public ReValue get(@Nonnull FieldInsnNode field) {
+				return collector.hasLookup(field) ? collector.get(field) : fallback.get(field);
+			}
+
+			@Override
+			public boolean hasLookup(@Nonnull FieldInsnNode field) {
+				return collector.hasLookup(field) || fallback.hasLookup(field);
+			}
+		});
+	}
+
 	@Nonnull
 	@Override
 	public Set<Class<? extends ClassTransformer>> recommendedSuccessors() {
@@ -146,8 +203,13 @@ public class CallResultInliningTransformer implements JvmClassTransformer {
 
 	@Nonnull
 	@Override
-	public String name() {
-		return "Call result inlining";
+	public String identifier() {
+		return IDENTIFIER;
 	}
 
+	@Nonnull
+	@Override
+	public List<TransformationParameter<?>> getParameterDefinitions() {
+		return List.of(MAX_STEPS_PARAMETER, EVALUATE_CLASS_INITIALIZERS_PARAMETER);
+	}
 }
